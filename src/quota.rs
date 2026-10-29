@@ -17,9 +17,7 @@
 //! **有凭据才问，有数才显示**（[`Provider::ready`] 与 [`step`]）：没 key、没登录的供应商
 //! 整块不出现，也不为它发请求。面板上只留能看的数，而不是一排 `Unavailable`。
 //!
-//! 凭据顺序：环境变量 → Ante 自己的 `auth/api_keys.json`。ChatGPT 用 `/connect`
-//! 落下的 `auth/openai.json`，过期就现刷一次 —— 只用于本次请求，不写回文件（续期
-//! 是 Ante 的事，两边同时写会打架）。
+//! API key 凭据按 catalog 引用解析；OAuth 格式未确认时不读取或刷新。
 //!
 //! 缓存：成功 5 分钟、失败 60 秒。侧栏每 60 秒问一次，而这些接口都算敏感，失败
 //! 还去重试只会更快被限流。5 分钟对得上上游插件的 `minIntervalMs` 默认值。
@@ -36,7 +34,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{SecondsFormat, TimeZone, Utc};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 /// 面板按 36 列排版：上游插件的侧栏宽度，也是客户端侧栏的实际宽度。
@@ -54,10 +52,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 这些站点前面是 Cloudflare：默认 UA 会被挡成 403（code 1010），与 key 无关。
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36";
-
-/// ChatGPT 的订阅用量与 Codex 用同一个 OAuth 应用，client id 从 Ante 二进制里读出来
-/// （与 `integrations.rs` 的预设一致，续期要用同一个）。
-const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 /// OpenCode 的 console（网页登录）会话令牌：它在 catalog 之外，但一样能证明「这家配过」。
 /// 它只用于 console 那条路，别当 API key 发到 zen 去。
@@ -295,7 +289,7 @@ async fn cached(provider: &'static Provider, connected: &HashSet<String>) -> Opt
 // -------------------------------------------------------------------- 取数 --
 
 async fn deepseek(keys: &[&str]) -> Result<Quota, String> {
-    let key = credential(keys).ok_or_else(|| missing(keys))?;
+    let key = provider_credential("deepseek", keys).await.ok_or_else(|| missing(keys))?;
     let body = get_json("https://api.deepseek.com/user/balance", &key, &[]).await?;
     let info = body
         .get("balance_infos")
@@ -314,7 +308,7 @@ async fn deepseek(keys: &[&str]) -> Result<Quota, String> {
 }
 
 async fn commandcode(keys: &[&str]) -> Result<Quota, String> {
-    let key = credential(keys).ok_or_else(|| missing(keys))?;
+    let key = provider_credential("command-code", keys).await.ok_or_else(|| missing(keys))?;
     let body = get_json("https://api.commandcode.ai/alpha/billing/credits", &key, &[]).await?;
     let limits = body.get("windowLimits").and_then(Value::as_object);
     let mut rows = Vec::new();
@@ -392,11 +386,11 @@ async fn commandcode_month_window(key: &str, remaining: f64) -> Option<(f64, Opt
 async fn chatgpt() -> Result<Quota, String> {
     let credential = openai_credential().await?;
     let account = account_id(&credential.access);
-    let mut headers: Vec<(&str, &str)> = vec![("Authorization", credential.access.as_str())];
+    let mut headers: Vec<(&str, &str)> = Vec::new();
     if let Some(account) = account.as_deref() {
         headers.push(("ChatGPT-Account-Id", account));
     }
-    let body = get_json("https://chatgpt.com/backend-api/wham/usage", "", &headers).await?;
+    let body = get_json("https://chatgpt.com/backend-api/wham/usage", &credential.access, &headers).await?;
     let mut rows = Vec::new();
     let rate_limit = body.get("rate_limit").and_then(Value::as_object);
     for (field, fallback) in [("primary_window", "5h"), ("secondary_window", "W")] {
@@ -431,55 +425,21 @@ struct OpenAiCredential {
     access: String,
 }
 
-/// `/connect` 写下的那份凭证：有 `access_token`/`refresh_token`/`expires_at`。
-/// 过期就续一次（同一个 client id、JSON 编码），只在内存里用，不写回。
+/// Read a still-valid token; refresh remains Ante's responsibility so a quota
+/// request cannot consume a rotating refresh token behind its back.
 async fn openai_credential() -> Result<OpenAiCredential, String> {
-    let path = crate::ante_home().join("auth").join("openai.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|_| "not signed in (/connect)".to_string())?;
-    let stored: Value = serde_json::from_str(&text).map_err(|_| "cannot read auth/openai.json".to_string())?;
-    let access = stored
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or("the credential has no access_token")?
-        .to_string();
-    let expires_at = stored
-        .get("expires_at")
-        .and_then(Value::as_str)
-        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok());
-    let wants_refresh = expires_at.is_some_and(|at| at.timestamp_millis() <= now_ms());
-    if !wants_refresh {
-        return Ok(OpenAiCredential { access });
+    let path = crate::ante_home().join("auth/credentials/oauth/openai.json");
+    let text = std::fs::read_to_string(path).map_err(|_| "not signed in (/connect)".to_string())?;
+    let stored: Value = serde_json::from_str(&text).map_err(|_| "cannot read OAuth credential".to_string())?;
+    let expires = stored.get("expires_at").and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .ok_or("OAuth credential has no valid expiry")?;
+    if expires.timestamp_millis() <= now_ms() {
+        return Err("OAuth token expired; use Ante to refresh it".to_string());
     }
-    let refresh = stored
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or("the token expired and there is no refresh_token")?;
-    let issuer = crate::env_or("ANTEX_OPENAI_ISSUER", "https://auth.openai.com");
-    let response = http()
-        .post(format!("{issuer}/oauth/token"))
-        .json(&json!({
-            "client_id": OPENAI_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("the refresh request could not be sent: {e}"))?;
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        return Err(format!("refresh rejected (HTTP {status}); run /connect again"));
-    }
-    let access = body
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or("the refresh response has no access_token")?
-        .to_string();
-    Ok(OpenAiCredential { access })
+    let access = stored.get("access_token").and_then(Value::as_str)
+        .filter(|s| !s.is_empty()).ok_or("OAuth credential has no access token")?;
+    Ok(OpenAiCredential { access: access.to_string() })
 }
 
 /// access token 里的 `chatgpt_account_id`（与 Ante 读的是同一个声明）。
@@ -510,7 +470,7 @@ async fn opencode(keys: &[&str]) -> Result<Quota, String> {
         }
     }
     let api_keys: Vec<&str> = keys.iter().copied().filter(|name| *name != CONSOLE_TOKEN).collect();
-    let key = credential(&api_keys).ok_or_else(|| missing(&api_keys))?;
+    let key = provider_credential("opencode-go", &api_keys).await.ok_or_else(|| missing(&api_keys))?;
     let body = match get_json("https://opencode.ai/zen/go/v1/usage", &key, &[]).await {
         Ok(body) => body,
         Err(message) => {
@@ -805,28 +765,41 @@ fn missing(names: &[&str]) -> String {
     format!("no {}", names.join(" / "))
 }
 
-/// 环境变量 → `auth/api_keys.json`（`/connect` 存 API key 也是存这里）。
-fn credential(names: &[&str]) -> Option<String> {    for name in names {
-        if let Ok(value) = std::env::var(name) {
-            if !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    let keys = api_keys();
-    names
-        .iter()
-        .find_map(|name| keys.get(*name).and_then(Value::as_str))
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
+/// 额外环境变量只用于 catalog 之外的凭据。
+fn credential(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).map(|v| v.trim().to_string()))
 }
 
-fn api_keys() -> Map<String, Value> {
-    std::fs::read_to_string(crate::ante_home().join("auth").join("api_keys.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+fn secret_value(home: &std::path::Path, name: &str) -> Option<String> {
+    if name.is_empty() || !name.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        return None;
+    }
+    let path = home.join("auth/credentials/secret").join(format!("{name}.json"));
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    value.get("value")?.as_str().filter(|v| !v.trim().is_empty()).map(|v| v.trim().to_string())
+}
+
+fn resolve_refs(spec: &Value, home: &std::path::Path) -> Option<String> {
+    let refs = spec.get("credential")?;
+    let refs: Vec<&str> = match refs {
+        Value::String(s) => vec![s],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    refs.into_iter().find_map(|r| {
+        if let Some(name) = r.strip_prefix("env:") { credential(&[name]) }
+        else if let Some(name) = r.strip_prefix("secret:") { secret_value(home, name) }
+        else { None }
+    })
+}
+
+async fn provider_credential(id: &str, fallback: &[&str]) -> Option<String> {
+    let catalog = crate::integrations::merged_catalog().await;
+    if let Some(spec) = catalog.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id)) {
+        resolve_refs(spec, &crate::ante_home()).or_else(|| credential(fallback))
+    } else {
+        credential(fallback)
+    }
 }
 
 fn number(object: &Value, field: &str) -> f64 {
@@ -849,6 +822,13 @@ fn rfc3339_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unsafe_secret_names() {
+        for name in ["", "../secret", "/absolute", "a/../b"] {
+            assert!(secret_value(std::path::Path::new("/nonexistent"), name).is_none());
+        }
+    }
 
     fn provider(id: &'static str, env_keys: &'static [&'static str]) -> Provider {
         Provider {

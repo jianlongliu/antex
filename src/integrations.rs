@@ -72,6 +72,7 @@ struct Provider {
     id: String,
     name: String,
     env_key: Option<String>,
+    secret: Option<String>,
     preset: Option<String>,
 }
 
@@ -94,19 +95,25 @@ pub async fn merged_catalog() -> Vec<Value> {
 
 /// `auth` is written as one of `bearer` / `header` / `query`; the credential
 /// kind never changes what we do with it.
-fn auth_of(spec: &Value) -> (Option<String>, Option<String>) {
-    let Some(auth) = spec.get("auth") else {
-        return (None, None);
-    };
-    for kind in ["bearer", "header", "query"] {
-        let Some(node) = auth.get(kind) else { continue };
-        let env = node.get("env_key").and_then(Value::as_str).map(str::to_string);
-        let preset = node.get("oauth_preset").and_then(Value::as_str).map(str::to_string);
-        if env.is_some() || preset.is_some() {
-            return (env, preset);
-        }
+fn credential_refs(spec: &Value) -> Option<Vec<&str>> {
+    match spec.get("credential") {
+        None | Some(Value::Null) => Some(vec![]),
+        Some(Value::String(s)) => Some(vec![s]),
+        Some(Value::Array(items)) => items.iter().map(Value::as_str).collect(),
+        _ => None,
     }
-    (None, None)
+}
+
+fn auth_of(spec: &Value) -> (Option<String>, Option<String>, Option<String>) {
+    let mut env = None;
+    let mut secret = None;
+    let mut oauth = None;
+    for reference in credential_refs(spec).unwrap_or_default() {
+        if let Some(name) = reference.strip_prefix("env:") { env.get_or_insert_with(|| name.to_string()); }
+        if let Some(name) = reference.strip_prefix("secret:") { secret.get_or_insert_with(|| name.to_string()); }
+        if let Some(name) = reference.strip_prefix("oauth:") { oauth.get_or_insert_with(|| name.to_string()); }
+    }
+    (env, secret, oauth)
 }
 
 async fn providers() -> Vec<Provider> {
@@ -120,12 +127,16 @@ async fn providers() -> Vec<Provider> {
                 .and_then(Value::as_str)
                 .unwrap_or(&id)
                 .to_string();
-            let (env_key, preset) = auth_of(spec);
-            // No credential of either kind: nothing for `/connect` to offer.
-            if env_key.is_none() && preset.is_none() {
+            let refs = credential_refs(spec)?;
+            if refs.iter().any(|r| !["env:", "secret:", "oauth:"].iter().any(|prefix| r.starts_with(prefix)))
+                || ["env:", "secret:", "oauth:"].iter().any(|prefix| refs.iter().filter(|r| r.starts_with(*prefix)).count() > 1) {
                 return None;
             }
-            Some(Provider { id, name, env_key, preset })
+            let (env_key, secret, preset) = auth_of(spec);
+            if env_key.is_none() && secret.is_none() && preset.is_none() {
+                return None;
+            }
+            Some(Provider { id, name, env_key, secret, preset })
         })
         .collect()
 }
@@ -137,13 +148,14 @@ async fn providers() -> Vec<Provider> {
 /// This is the bare rule, with no exceptions — [`connected_providers`] adds one
 /// on top of it, and [`credentialed_ids`] deliberately does not.
 fn has_credentials(spec: &Value, keys: &Map<String, Value>, presets: &[String]) -> bool {
-    let (env_key, preset) = auth_of(spec);
-    match (env_key, preset) {
-        (None, None) => true,
-        (Some(env), _) if std::env::var_os(&env).is_some() || keys.contains_key(&env) => true,
-        (_, Some(preset)) => presets.iter().any(|held| held == &preset),
-        _ => false,
-    }
+    let Some(refs) = credential_refs(spec) else { return false };
+    if refs.is_empty() { return true; }
+    refs.iter().any(|reference| {
+        if let Some(name) = reference.strip_prefix("env:") { return std::env::var_os(name).is_some(); }
+        if let Some(name) = reference.strip_prefix("secret:") { return keys.contains_key(name); }
+        if let Some(name) = reference.strip_prefix("oauth:") { return presets.iter().any(|held| held == name); }
+        false
+    })
 }
 
 /// The providers Ante can actually reach right now: an env key exported in this
@@ -208,27 +220,29 @@ fn oauth_path(preset: &str) -> PathBuf {
     auth_dir().join(format!("{preset}.json"))
 }
 
-fn read_api_keys() -> Map<String, Value> {
-    std::fs::read_to_string(api_keys_path())
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+fn stored_credentials() -> (Map<String, Value>, Vec<String>) {
+    let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
+    let mut keys = Map::new();
+    let mut presets = Vec::new();
+    if let Ok(out) = std::process::Command::new(bin).args(["auth", "list"]).output() {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+                let mut fields = line.split_whitespace();
+                if let (Some(name), Some(kind)) = (fields.next(), fields.next()) {
+                    match kind {
+                        "secret" => { keys.insert(name.to_string(), Value::Bool(true)); }
+                        "oauth" => presets.push(name.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    (keys, presets)
 }
 
-fn stored_presets() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(auth_dir()) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let stem = name.strip_suffix(".json")?.to_string();
-            (stem != "api_keys" && entry.path().is_file()).then_some(stem)
-        })
-        .collect()
-}
+fn read_api_keys() -> Map<String, Value> { stored_credentials().0 }
+fn stored_presets() -> Vec<String> { stored_credentials().1 }
 
 /// Keep one copy of a credential file from before the first write we make to
 /// it: this is the user's own sign-in, and a `.bak` is the cheapest way back.
@@ -285,16 +299,13 @@ fn integration_json(p: &Provider, keys: &Map<String, Value>, presets: &[String])
         }
     }
     if let Some(env) = &p.env_key {
-        methods.push(json!({ "type": "key", "label": format!("Paste {env}") }));
         methods.push(json!({ "type": "env", "names": [env] }));
-        if std::env::var_os(env).is_some() {
-            connections.push(json!({ "type": "env", "name": env }));
-        }
-        if keys.contains_key(env) {
-            connections.push(json!({
-                "type": "credential", "id": p.id, "method": "key",
-                "label": format!("{env} (from auth/api_keys.json)"),
-            }));
+        if std::env::var_os(env).is_some() { connections.push(json!({ "type": "env", "name": env })); }
+    }
+    if let Some(secret) = &p.secret {
+        methods.push(json!({ "type": "key", "label": format!("Paste key for {secret}") }));
+        if keys.contains_key(secret) {
+            connections.push(json!({ "type": "credential", "id": p.id, "method": "key", "label": secret }));
         }
     }
     json!({ "id": p.id, "name": p.name, "methods": methods, "connections": connections })
@@ -328,21 +339,32 @@ pub async fn connect_key(Path(id): Path<String>, Json(body): Json<Value>) -> Res
     let Some(p) = provider(&id).await else {
         return error(StatusCode::NOT_FOUND, format!("Ante's catalog has no {id}"));
     };
-    let Some(env) = p.env_key.clone() else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!("{} is not a provider that signs in with an API key (its catalog entry has no env_key)", p.name),
-        );
+    let Some(secret) = p.secret.clone() else {
+        return error(StatusCode::BAD_REQUEST, "provider has no supported secret credential");
     };
+    let (keys, _) = stored_credentials();
+    if secret.contains('/') || keys.keys().any(|name| name.starts_with(&format!("{secret}/"))) {
+        return error(StatusCode::BAD_REQUEST, "multiple or labeled accounts are not supported here");
+    }
     let key = body.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if key.is_empty() {
         return error(StatusCode::BAD_REQUEST, "the key is empty");
     }
-    let mut keys = read_api_keys();
-    keys.insert(env, Value::String(key));
-    match write_private(&api_keys_path(), &Value::Object(keys).to_string()) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(message) => error(StatusCode::INTERNAL_SERVER_ERROR, message),
+    let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
+    let mut child = match tokio::process::Command::new(bin).args(["auth", "add", &secret])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(child) => child,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot start ante auth add: {e}")),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(format!("{key}\n").as_bytes()).await.is_err() {
+            let _ = child.kill().await;
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "cannot send key to ante auth add");
+        }
+    }
+    match child.wait().await {
+        Ok(status) if status.success() => StatusCode::NO_CONTENT.into_response(),
+        _ => error(StatusCode::BAD_REQUEST, "ante auth add failed; key was not confirmed stored"),
     }
 }
 
@@ -353,7 +375,7 @@ pub async fn credentials() -> Json<Value> {
     let keys = read_api_keys();
     let mut data = Vec::new();
     for p in providers().await {
-        if let Some(env) = &p.env_key {
+        if let Some(env) = &p.secret {
             if keys.contains_key(env) {
                 data.push(json!({
                     "id": p.id, "integrationID": p.id, "label": env, "active": false,
@@ -362,7 +384,7 @@ pub async fn credentials() -> Json<Value> {
             }
         }
         if let Some(preset) = &p.preset {
-            if oauth_path(preset).is_file() {
+            if stored_presets().contains(preset) {
                 data.push(json!({
                     "id": p.id, "integrationID": p.id, "label": p.name, "active": false,
                     "value": { "type": "oauth", "methodID": "oauth", "refresh": "", "access": "", "expires": 0 },
@@ -379,37 +401,38 @@ pub async fn credential_delete(Path(id): Path<String>) -> Response {
     let Some(p) = provider(&id).await else {
         return error(StatusCode::NOT_FOUND, format!("Ante's catalog has no {id}"));
     };
-    let mut removed = false;
+    let (keys, presets) = stored_credentials();
+    let mut targets = Vec::new();
+    if let Some(secret) = &p.secret {
+        if secret.contains('/') || keys.keys().any(|name| name.starts_with(&format!("{secret}/"))) {
+            return error(StatusCode::BAD_REQUEST, "multiple or labeled accounts cannot be deleted here");
+        }
+        if keys.contains_key(secret) { targets.push(format!("secret:{secret}")); }
+    }
     if let Some(preset) = &p.preset {
-        let path = oauth_path(preset);
-        if path.is_file() {
-            backup_once(&path);
-            if let Err(e) = std::fs::remove_file(&path) {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot delete {}: {e}", path.display()));
-            }
-            removed = true;
+        if preset.contains('/') || presets.iter().any(|name| name.starts_with(&format!("{preset}/"))) {
+            return error(StatusCode::BAD_REQUEST, "multiple or labeled accounts cannot be deleted here");
         }
+        if presets.contains(preset) { targets.push(format!("oauth:{preset}")); }
     }
-    if let Some(env) = &p.env_key {
-        let mut keys = read_api_keys();
-        if keys.remove(env).is_some() {
-            if let Err(message) = write_private(&api_keys_path(), &Value::Object(keys).to_string()) {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, message);
-            }
-            removed = true;
-        }
-    }
-    if removed {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        error(StatusCode::NOT_FOUND, format!("no stored credential for {}", p.name))
+    if targets.len() > 1 { return error(StatusCode::BAD_REQUEST, "ambiguous credentials; delete them with ante auth rm"); }
+    let Some(target) = targets.first() else { return error(StatusCode::NOT_FOUND, format!("no stored credential for {}", p.name)); };
+    let shared = merged_catalog().await.into_iter().any(|spec| {
+        spec.get("id").and_then(Value::as_str) != Some(id.as_str())
+            && credential_refs(&spec).is_some_and(|refs| refs.contains(&target.as_str()))
+    });
+    if shared { return error(StatusCode::BAD_REQUEST, "credential is shared by other providers; manage it with ante auth rm"); }
+    let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
+    match tokio::process::Command::new(bin).args(["auth", "rm", target]).output().await {
+        Ok(out) if out.status.success() => StatusCode::NO_CONTENT.into_response(),
+        _ => error(StatusCode::INTERNAL_SERVER_ERROR, "ante auth rm failed"),
     }
 }
 
 /// Ante keeps one credential per provider, so there is nothing to switch
 /// between — but the client calls this when a connection is clicked.
 pub async fn credential_activate(Path(_id): Path<String>) -> Response {
-    StatusCode::NO_CONTENT.into_response()
+    error(StatusCode::BAD_REQUEST, "account activation is not supported; use Ante to select an account")
 }
 
 pub async fn credential_update(Path(_id): Path<String>, Json(_body): Json<Value>) -> Response {
@@ -468,6 +491,9 @@ pub async fn connect_oauth(Path(id): Path<String>, Json(_body): Json<Value>) -> 
     let Some(preset) = p.preset.clone() else {
         return error(StatusCode::BAD_REQUEST, format!("{} is not a provider that signs in with OAuth", p.name));
     };
+    if preset.contains('/') || stored_presets().iter().any(|name| name.starts_with(&format!("{preset}/"))) {
+        return error(StatusCode::BAD_REQUEST, "multiple or labeled accounts are not supported here");
+    }
     let attempt_id = format!("att_{}", token(9));
     let created_ms = crate::now_ms();
     {
@@ -480,13 +506,7 @@ pub async fn connect_oauth(Path(id): Path<String>, Json(_body): Json<Value>) -> 
             Attempt { state: AttemptState::Pending, created_ms, cancel: None },
         );
     }
-    let started = match preset.as_str() {
-        "openai" => start_openai(&attempt_id).await,
-        "antix" => start_antix(&attempt_id).await,
-        other => Err(format!(
-            "antex has no OAuth for {other} yet. Of the three Ante can sign in, ChatGPT is handled here and Antix goes through `ante auth login`; {other} still has to be signed in from Ante's own TUI."
-        )),
-    };
+    let started = start_antix(&attempt_id, &preset).await;
     match started {
         Ok((url, instructions, cancel)) => {
             if let Some(attempt) = attempts().lock().await.get_mut(&attempt_id) {
@@ -690,6 +710,10 @@ fn parse_callback(request: &str, expected_state: &str) -> Callback {
             _ => {}
         }
     }
+    // Reject both success and error callbacks from a different OAuth attempt.
+    if state.as_deref() != Some(expected_state) {
+        return Callback::Stray;
+    }
     if let Some(message) = failure {
         return Callback::Failed(message);
     }
@@ -781,33 +805,8 @@ fn failure_detail(body: &Value) -> String {
 /// the token set. Ante parses the access token for `chatgpt_account_id`, so the
 /// real token matters — none of it is synthesized here.
 fn write_openai_credential(tokens: &Value) -> Result<(), String> {
-    let access = tokens
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or("the token response has no access_token")?;
-    let refresh = tokens
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .ok_or("the token response has no refresh_token — the sign-in cannot be renewed, so Ante cannot use it")?;
-    let expires_in = tokens.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
-    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(expires_in))
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-    let scopes: Vec<String> = tokens
-        .get("scope")
-        .and_then(Value::as_str)
-        .map(|raw| raw.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default();
-    let credential = json!({
-        "client_id": OPENAI_CLIENT_ID,
-        "token_issuer": openai_issuer(),
-        "token_request_encoding": "json",
-        "id_token": tokens.get("id_token").cloned().unwrap_or(Value::String(String::new())),
-        "access_token": access,
-        "refresh_token": refresh,
-        "expires_at": expires_at,
-        "scopes": scopes,
-    });
-    write_private(&oauth_path("openai"), &credential.to_string())
+    let _ = tokens;
+    Err("legacy OAuth credential writing is disabled; use ante auth login".into())
 }
 
 // -------------------------------------------------------------------- Antix --
@@ -815,10 +814,11 @@ fn write_openai_credential(tokens: &Value) -> Result<(), String> {
 /// Antix is the one preset the CLI can sign into, so the child does the whole
 /// flow (browser, callback, credential file) and we only carry its URL to the
 /// dialog and its exit status to the poller.
-async fn start_antix(attempt_id: &str) -> Result<(String, String, CancelFn), String> {
+async fn start_antix(attempt_id: &str, preset: &str) -> Result<(String, String, CancelFn), String> {
     let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
     let mut child = tokio::process::Command::new(bin)
-        .args(["auth", "login", "antix"])
+        .args(["auth", "login", preset])
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -895,4 +895,19 @@ fn token(bytes: usize) -> String {
         }
     }
     URL_SAFE_NO_PAD.encode(buf)
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_credential_shapes_and_unknown_helpers() {
+        let keys = Map::from_iter([(String::from("example"), Value::Bool(true))]);
+        assert!(has_credentials(&json!({"credential": null}), &keys, &[]));
+        assert!(has_credentials(&json!({"credential": "secret:example"}), &keys, &[]));
+        assert!(has_credentials(&json!({"credential": ["oauth:openai", "secret:example"]}), &keys, &[]));
+        assert!(!has_credentials(&json!({"credential": "helper:example"}), &keys, &[]));
+        assert!(!has_credentials(&json!({"credential": [42]}), &keys, &[]));
+    }
 }
