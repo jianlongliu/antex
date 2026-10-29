@@ -147,13 +147,46 @@ async fn providers() -> Vec<Provider> {
 ///
 /// This is the bare rule, with no exceptions — [`connected_providers`] adds one
 /// on top of it, and [`credentialed_ids`] deliberately does not.
+/// The account Ante resolves for one credential reference.
+///
+/// An exact name wins. An unlabelled reference (`secret:deepseek`) otherwise
+/// takes the **lexicographically first** account stored under it
+/// (`deepseek/work` beats `deepseek/home`), independent of insertion order —
+/// measured against Ante 0.3.0 with two labelled secrets and a local endpoint
+/// that recorded the Authorization header. A labelled reference never falls
+/// back to a different account.
+///
+/// Model filtering, the connection lists and the quota panel all go through
+/// this, so one screen cannot disagree with another about which account is in
+/// use.
+pub fn resolve_held<'a>(reference: &str, held: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut best: Option<&'a str> = None;
+    for name in held {
+        if name == reference {
+            return Some(name.to_string());
+        }
+        if reference.contains('/') {
+            continue;
+        }
+        let Some(suffix) = name.strip_prefix(reference) else { continue };
+        if suffix.starts_with('/') && suffix.len() > 1 && best.is_none_or(|current| name < current) {
+            best = Some(name);
+        }
+    }
+    best.map(str::to_string)
+}
+
+fn credential_name_matches(reference: &str, held: &str) -> bool {
+    resolve_held(reference, [held]).is_some()
+}
+
 fn has_credentials(spec: &Value, keys: &Map<String, Value>, presets: &[String]) -> bool {
     let Some(refs) = credential_refs(spec) else { return false };
     if refs.is_empty() { return true; }
     refs.iter().any(|reference| {
         if let Some(name) = reference.strip_prefix("env:") { return std::env::var_os(name).is_some(); }
-        if let Some(name) = reference.strip_prefix("secret:") { return keys.contains_key(name); }
-        if let Some(name) = reference.strip_prefix("oauth:") { return presets.iter().any(|held| held == name); }
+        if let Some(name) = reference.strip_prefix("secret:") { return keys.keys().any(|held| credential_name_matches(name, held)); }
+        if let Some(name) = reference.strip_prefix("oauth:") { return presets.iter().any(|held| credential_name_matches(name, held)); }
         false
     })
 }
@@ -292,7 +325,7 @@ fn integration_json(p: &Provider, keys: &Map<String, Value>, presets: &[String])
     let mut connections = Vec::new();
     if let Some(preset) = &p.preset {
         methods.push(json!({ "type": "oauth", "id": "oauth", "label": oauth_label(preset) }));
-        if presets.iter().any(|held| held == preset) {
+        if presets.iter().any(|held| credential_name_matches(preset, held)) {
             connections.push(json!({
                 "type": "credential", "id": p.id, "label": p.name, "method": "oauth",
             }));
@@ -304,7 +337,7 @@ fn integration_json(p: &Provider, keys: &Map<String, Value>, presets: &[String])
     }
     if let Some(secret) = &p.secret {
         methods.push(json!({ "type": "key", "label": format!("Paste key for {secret}") }));
-        if keys.contains_key(secret) {
+        if keys.keys().any(|held| credential_name_matches(secret, held)) {
             connections.push(json!({ "type": "credential", "id": p.id, "method": "key", "label": secret }));
         }
     }
@@ -371,26 +404,32 @@ pub async fn connect_key(Path(id): Path<String>, Json(body): Json<Value>) -> Res
 // The TUI reads connections off `/api/integration`; this is the same store in
 // the shape other clients ask for. Secrets are left out — nothing in the shim
 // needs to hand a token back out over HTTP.
+fn credential_entries(p: &Provider, keys: &Map<String, Value>, presets: &[String]) -> Vec<Value> {
+    let mut data = Vec::new();
+    if let Some(secret) = &p.secret {
+        if keys.keys().any(|held| credential_name_matches(secret, held)) {
+            data.push(json!({
+                "id": p.id, "integrationID": p.id, "label": secret, "active": false,
+                "value": { "type": "key", "key": "" },
+            }));
+        }
+    }
+    if let Some(preset) = &p.preset {
+        if presets.iter().any(|held| credential_name_matches(preset, held)) {
+            data.push(json!({
+                "id": p.id, "integrationID": p.id, "label": p.name, "active": false,
+                "value": { "type": "oauth", "methodID": "oauth", "refresh": "", "access": "", "expires": 0 },
+            }));
+        }
+    }
+    data
+}
+
 pub async fn credentials() -> Json<Value> {
-    let keys = read_api_keys();
+    let (keys, presets) = stored_credentials();
     let mut data = Vec::new();
     for p in providers().await {
-        if let Some(env) = &p.secret {
-            if keys.contains_key(env) {
-                data.push(json!({
-                    "id": p.id, "integrationID": p.id, "label": env, "active": false,
-                    "value": { "type": "key", "key": "" },
-                }));
-            }
-        }
-        if let Some(preset) = &p.preset {
-            if stored_presets().contains(preset) {
-                data.push(json!({
-                    "id": p.id, "integrationID": p.id, "label": p.name, "active": false,
-                    "value": { "type": "oauth", "methodID": "oauth", "refresh": "", "access": "", "expires": 0 },
-                }));
-            }
-        }
+        data.extend(credential_entries(&p, &keys, &presets));
     }
     Json(json!({ "data": data }))
 }
@@ -900,6 +939,57 @@ fn token(bytes: usize) -> String {
 #[cfg(test)]
 mod credential_tests {
     use super::*;
+
+    #[test]
+    fn resolution_matches_antes_own_account_choice() {
+        // Measured against Ante 0.3.0: an exact name wins, otherwise the
+        // lexicographically first label, whatever the insertion order.
+        assert_eq!(resolve_held("s", ["s", "s/work"]).as_deref(), Some("s"));
+        assert_eq!(resolve_held("s", ["s/work", "s"]).as_deref(), Some("s"));
+        assert_eq!(resolve_held("s", ["s/zzz", "s/aaa"]).as_deref(), Some("s/aaa"));
+        assert_eq!(resolve_held("s", ["s/mm", "s/bb"]).as_deref(), Some("s/bb"));
+        assert_eq!(resolve_held("s", ["s/work"]).as_deref(), Some("s/work"));
+        // A labelled reference never borrows another account.
+        assert_eq!(resolve_held("s/home", ["s/work"]), None);
+        assert_eq!(resolve_held("s/home", ["s/home"]).as_deref(), Some("s/home"));
+        // `examples/...` is not `example/...`.
+        assert_eq!(resolve_held("example", ["examples/work"]), None);
+        assert_eq!(resolve_held("s", ["s/"]), None);
+    }
+
+    #[test]
+    fn labelled_credentials_match_only_their_own_reference() {
+        let keys = Map::from_iter([(String::from("example/work"), Value::Bool(true))]);
+        let oauth = vec!["openai/work".to_string()];
+        assert!(has_credentials(&json!({"credential": "secret:example"}), &keys, &[]));
+        assert!(has_credentials(&json!({"credential": "oauth:openai"}), &Map::new(), &oauth));
+        assert!(!has_credentials(&json!({"credential": "secret:example/home"}), &keys, &[]));
+        assert!(!has_credentials(&json!({"credential": "oauth:openai/home"}), &Map::new(), &oauth));
+        assert!(!credential_name_matches("example", "examples/work"));
+    }
+
+    #[test]
+    fn listings_follow_label_matching_without_exposing_secrets() {
+        let keys = Map::from_iter([
+            ("example/work".into(), json!("private-key")),
+            ("example/home".into(), json!("another-private-key")),
+        ]);
+        let presets = vec!["openai/work".to_string(), "openai/home".to_string()];
+        for (secret, preset, expected) in [
+            ("example", "openai", true),
+            ("example/work", "openai/work", true),
+            ("example/other", "openai/other", false),
+        ] {
+            let p = Provider { id: "test".into(), name: "Test".into(), env_key: None,
+                secret: Some(secret.into()), preset: Some(preset.into()) };
+            let integration = integration_json(&p, &keys, &presets);
+            let entries = credential_entries(&p, &keys, &presets);
+            assert_eq!(integration["connections"].as_array().unwrap().len(), if expected { 2 } else { 0 });
+            assert_eq!(entries.len(), if expected { 2 } else { 0 });
+            assert!(!integration.to_string().contains("private-key"));
+            assert!(!json!(entries).to_string().contains("private-key"));
+        }
+    }
 
     #[test]
     fn catalog_credential_shapes_and_unknown_helpers() {

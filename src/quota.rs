@@ -425,10 +425,14 @@ struct OpenAiCredential {
     access: String,
 }
 
-/// Read a still-valid token; refresh remains Ante's responsibility so a quota
-/// request cannot consume a rotating refresh token behind its back.
+/// Read a still-valid token for the account Ante itself would pick, using the
+/// same resolution as the model picker ([`crate::integrations::resolve_held`]):
+/// an exact `openai` credential wins, else the lexicographically first labelled
+/// one. Refreshing stays Ante's job so a quota request cannot consume a
+/// rotating refresh token behind its back.
 async fn openai_credential() -> Result<OpenAiCredential, String> {
-    let path = crate::ante_home().join("auth/credentials/oauth/openai.json");
+    let home = crate::ante_home();
+    let path = openai_credential_path(&home).ok_or_else(|| "not signed in (/connect)".to_string())?;
     let text = std::fs::read_to_string(path).map_err(|_| "not signed in (/connect)".to_string())?;
     let stored: Value = serde_json::from_str(&text).map_err(|_| "cannot read OAuth credential".to_string())?;
     let expires = stored.get("expires_at").and_then(Value::as_str)
@@ -440,6 +444,38 @@ async fn openai_credential() -> Result<OpenAiCredential, String> {
     let access = stored.get("access_token").and_then(Value::as_str)
         .filter(|s| !s.is_empty()).ok_or("OAuth credential has no access token")?;
     Ok(OpenAiCredential { access: access.to_string() })
+}
+
+/// OAuth profiles stored under `auth/credentials/oauth/`, labelled ones
+/// included as `openai/work` so they read the same as `ante auth list`.
+/// Which stored sign-in the ChatGPT quota belongs to: the same account
+/// resolution the model picker uses, so the panel cannot report one account's
+/// usage while the picker runs on another.
+fn openai_credential_path(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let held = stored_oauth_names(home);
+    let name = crate::integrations::resolve_held("openai", held.iter().map(String::as_str))?;
+    Some(home.join("auth/credentials/oauth").join(format!("{name}.json")))
+}
+
+fn stored_oauth_names(home: &std::path::Path) -> Vec<String> {
+    let root = home.join("auth/credentials/oauth");
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                let Ok(rel) = path.strip_prefix(root) else { continue };
+                let mut name = rel.to_string_lossy().into_owned();
+                name.truncate(name.len() - ".json".len());
+                out.push(name);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
+    out
 }
 
 /// access token 里的 `chatgpt_account_id`（与 Ante 读的是同一个声明）。
@@ -770,13 +806,53 @@ fn credential(names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()).map(|v| v.trim().to_string()))
 }
 
+fn valid_secret_name(name: &str) -> bool {
+    !name.is_empty() && name.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+}
+
 fn secret_value(home: &std::path::Path, name: &str) -> Option<String> {
-    if name.is_empty() || !name.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+    if !valid_secret_name(name) {
         return None;
     }
     let path = home.join("auth/credentials/secret").join(format!("{name}.json"));
     let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     value.get("value")?.as_str().filter(|v| !v.trim().is_empty()).map(|v| v.trim().to_string())
+}
+
+/// Secrets stored under `auth/credentials/secret/`, labelled ones as
+/// `deepseek/work`, so an unlabelled reference can resolve the same account
+/// Ante would.
+fn stored_secret_names(home: &std::path::Path) -> Vec<String> {
+    let root = home.join("auth/credentials/secret");
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                let Ok(rel) = path.strip_prefix(root) else { continue };
+                let mut name = rel.to_string_lossy().into_owned();
+                name.truncate(name.len() - ".json".len());
+                out.push(name);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
+    out
+}
+
+/// The stored secret Ante picks for one reference: exact name, else the
+/// lexicographically first labelled account (see
+/// [`crate::integrations::resolve_held`]).
+fn secret_for_reference(home: &std::path::Path, name: &str) -> Option<String> {
+    if !valid_secret_name(name) {
+        return None;
+    }
+    let held = stored_secret_names(home);
+    let chosen = crate::integrations::resolve_held(name, held.iter().map(String::as_str))?;
+    secret_value(home, &chosen)
 }
 
 fn resolve_refs(spec: &Value, home: &std::path::Path) -> Option<String> {
@@ -788,7 +864,7 @@ fn resolve_refs(spec: &Value, home: &std::path::Path) -> Option<String> {
     };
     refs.into_iter().find_map(|r| {
         if let Some(name) = r.strip_prefix("env:") { credential(&[name]) }
-        else if let Some(name) = r.strip_prefix("secret:") { secret_value(home, name) }
+        else if let Some(name) = r.strip_prefix("secret:") { secret_for_reference(home, name) }
         else { None }
     })
 }
@@ -822,6 +898,32 @@ fn rfc3339_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_quota_panel_reads_the_account_the_picker_uses() {
+        let dir = std::env::temp_dir().join(format!("antex-quota-{}", std::process::id()));
+        let oauth = dir.join("auth/credentials/oauth");
+        std::fs::create_dir_all(oauth.join("openai")).unwrap();
+        for name in ["openai/work", "openai/home"] {
+            std::fs::write(oauth.join(format!("{name}.json")), "{}").unwrap();
+        }
+        // Unlabelled reference: lexicographically first label, as Ante does.
+        assert!(openai_credential_path(&dir).unwrap().ends_with("openai/home.json"));
+        std::fs::write(oauth.join("openai.json"), "{}").unwrap();
+        // An exact credential wins over any labelled one.
+        assert!(openai_credential_path(&dir).unwrap().ends_with("openai.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unlabelled_secret_resolves_the_account_ante_picks() {
+        let home = std::path::Path::new("/nonexistent");
+        assert!(secret_for_reference(home, "fixture").is_none());
+        assert!(stored_secret_names(home).is_empty());
+        assert!(secret_for_reference(home, "../escape").is_none());
+        assert!(valid_secret_name("work/deep"));
+        assert!(!valid_secret_name("a/../b"));
+    }
 
     #[test]
     fn rejects_unsafe_secret_names() {
