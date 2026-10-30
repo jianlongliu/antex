@@ -310,8 +310,52 @@ fn write_staged(prepared: &Prepared, name: &str) -> Result<PathBuf, String> {
 
 fn write_raw(bytes: &[u8], ext: &str, name: &str, fallback: &str) -> Result<PathBuf, String> {
     let stem = sanitize(name, fallback);
-    let path = paste_cache().join(format!("{STAGE_PREFIX}{}-{stem}.{ext}", stamp()));
-    write_file(&path, bytes)
+    let file = format!("{STAGE_PREFIX}{}-{stem}.{ext}", stamp());
+    let path = paste_cache().join(&file);
+    write_file(&path, bytes)?;
+    // A durable copy next to Ante's home: the cache directory is temporary by
+    // design, and a mention whose file is gone degrades back to plain text when
+    // the session is reopened — the image then silently disappears from the
+    // transcript instead of being lost only from the model's view.
+    if let Err(err) = write_file(&archive_dir().join(&file), bytes) {
+        crate::log_line(&format!("attachments: 归档副本写入失败：{err}"));
+    } else {
+        prune_archive();
+    }
+    Ok(path)
+}
+
+/// Where staged attachments are kept so a reopened session can still show them.
+/// `~/.ante/attachments`, alongside the transcripts that mention them.
+fn archive_dir() -> PathBuf {
+    crate::ante_home().join("attachments")
+}
+
+/// How long an archived attachment is worth keeping. Old enough for any session
+/// a person still reads, bounded so the directory cannot grow forever.
+const ARCHIVE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Sweep the archive at most once an hour per process. Doing it on every write
+/// would walk the directory for each pasted image; doing it once per process
+/// (the earlier shape) never runs at all when the app restarts often.
+fn prune_archive() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3600)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+    let Ok(entries) = std::fs::read_dir(archive_dir()) else { return };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        let Ok(age) = now.duration_since(modified) else { continue };
+        if age.as_secs() > ARCHIVE_TTL_SECS {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -501,14 +545,25 @@ pub fn from_log(recorded: &str) -> (String, Vec<Value>) {
     (shown.trim_end().to_string(), files)
 }
 
-/// One token, if it is a mention the shim staged and the file is still there.
+/// One token, if it is a mention the shim staged and the file can still be read.
+///
+/// The mention names the paste cache, which is temporary. When that file is
+/// gone, the archived copy under the same name is used instead — that is what
+/// keeps a reopened session's images in the transcript.
 fn restore(token: &str) -> Option<Value> {
     let path = PathBuf::from(token.strip_prefix('@')?.replace("\\ ", " "));
-    if !basename(&path).starts_with(STAGE_PREFIX) {
+    let name = basename(&path);
+    if !name.starts_with(STAGE_PREFIX) {
         return None;
     }
-    let bytes = std::fs::read(&path).ok()?;
-    let mime = mime_for(&path);
+    let (bytes, mime) = match std::fs::read(&path) {
+        Ok(bytes) => (bytes, mime_for(&path)),
+        Err(_) => {
+            let archived = archive_dir().join(&name);
+            let bytes = std::fs::read(&archived).ok()?;
+            (bytes, mime_for(&archived))
+        }
+    };
     let mut entry = entry(&bytes, &mime, &original_name(&path), None);
     entry["mime"] = json!(mime);
     Some(entry)
@@ -635,6 +690,28 @@ mod tests {
         assert_eq!(files[0]["mime"], "image/png");
         let path = PathBuf::from(token.trim_start_matches('@'));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_image_survives_the_cache_being_swept() {
+        // `/tmp` is temporary: a reopened session has to fall back to the copy
+        // archived under Ante's home, or the transcript silently loses the image.
+        let mut file = data_url("image/png", &png(64, 48));
+        file["name"] = json!("clipboard");
+        let (sent, _, _) = stage("看这张图", std::slice::from_ref(&file));
+        let token = sent.split_whitespace().last().expect("mention").to_string();
+        let path = PathBuf::from(token.trim_start_matches('@'));
+        assert!(path.exists(), "the cache copy is what Ante reads");
+        std::fs::remove_file(&path).expect("clear the cache copy");
+
+        let (shown, files) = from_log(&sent);
+        assert_eq!(shown, "看这张图");
+        assert_eq!(files.len(), 1, "the archived copy still comes back");
+        assert!(files[0]["mime"].as_str().unwrap_or("").starts_with("image/"));
+        assert!(files[0]["data"].as_str().unwrap_or("").len() > 100);
+
+        let archived = archive_dir().join(basename(&path));
+        let _ = std::fs::remove_file(archived);
     }
 
     #[test]
