@@ -4073,6 +4073,14 @@ fn note_open_session(session: &str) {
     if !safe_id(session) || !ante_home().join("sessions").join(session).is_dir() {
         return;
     }
+    // Only the window that owns the conversation may hand it to the next launch:
+    // a second window looking at the same list must not redirect tomorrow's
+    // start into a chat it was only peeking at. `claim_session` is a no-op when
+    // this process already holds it (the common case — the pointer follows the
+    // session being driven, not the one merely being browsed).
+    if claimed_session().as_deref().is_some_and(|held| held != session) {
+        return;
+    }
     remember_resume(session);
 }
 
@@ -4110,6 +4118,89 @@ fn resume_root() -> std::path::PathBuf {
         .join("antex")
 }
 
+/// A claim that this process is the one driving `session`, held under
+/// `<state>/antex/held/<session>.json` for as long as it lives.
+///
+/// Two `antex` windows may run side by side (the port falls through to the next
+/// free one), and Ante accepts a resume of a session that another connection is
+/// already driving — both then append to the same `events.jsonl`. That was
+/// reachable through the resume pointer alone: the second window read the same
+/// `last.json` and reopened the conversation the first was working in, which
+/// looks like two panes fighting over one chat (`2026-10-30`).
+///
+/// So the pointer is only offered to a process that can *claim* the session:
+/// a lock file whose OS lock dies with the process — a crashed window cannot
+/// leave a session locked, and there is no stale-lock timeout to get wrong.
+/// Another window then simply comes up on the home screen and starts its own.
+struct SessionClaim {
+    path: std::path::PathBuf,
+    /// Held for the life of the claim; dropping it releases the lock.
+    _file: std::fs::File,
+}
+
+impl SessionClaim {
+    fn take(session: &str) -> Option<Self> {
+        if !safe_id(session) {
+            return None;
+        }
+        let dir = resume_root().join("held");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("{session}.json"));
+        let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path).ok()?;
+        // `try_lock` is the whole answer: it fails exactly when a live process
+        // holds this session. (Rust 1.89+; the toolchain here is 1.99.)
+        file.try_lock().ok()?;
+        use std::io::Write as _;
+        let mut handle = &file;
+        let _ = handle.set_len(0);
+        let _ = write!(
+            handle,
+            "{}",
+            json!({ "pid": std::process::id(), "session": session, "at": now_ms() })
+        );
+        Some(Self { path, _file: file })
+    }
+}
+
+impl Drop for SessionClaim {
+    fn drop(&mut self) {
+        // The lock is gone either way; the file is only a breadcrumb, so a
+        // failure to unlink it is not worth reporting.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The session this process is driving, if it is driving one. Kept alive for the
+/// whole process so the claim (and its lock) outlives every list request.
+static CLAIMED: std::sync::OnceLock<std::sync::Mutex<Option<SessionClaim>>> = std::sync::OnceLock::new();
+
+fn claimed_session() -> Option<String> {
+    let slot = CLAIMED.get_or_init(|| std::sync::Mutex::new(None));
+    let mut held = slot.lock().ok()?;
+    match held.as_ref() {
+        Some(claim) => claim.path.file_stem().map(|name| name.to_string_lossy().into_owned()),
+        None => None,
+    }
+}
+
+/// Claim `session` for this process. `false` means another live window has it.
+fn claim_session(session: &str) -> bool {
+    if claimed_session().as_deref() == Some(session) {
+        return true;
+    }
+    let Some(claim) = SessionClaim::take(session) else {
+        return false;
+    };
+    let slot = CLAIMED.get_or_init(|| std::sync::Mutex::new(None));
+    match slot.lock() {
+        Ok(mut held) => {
+            *held = Some(claim);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Remember `session` as the one to reopen next time.
 fn remember_resume(session: &str) {
     let path = resume_file();
@@ -4127,18 +4218,23 @@ fn remember_resume(session: &str) {
     }
 }
 
-/// The session left open last time, if Ante can still reopen it.
+/// The session left open last time, if Ante can still reopen it **and** no other
+/// window is already driving it.
 ///
 /// Only sessions with `dialog.json` are handed back: that snapshot is what
 /// `ResumeSession` restores (verified against Ante 0.3 — without it Ante answers
 /// `Failed to resume session`), and naming an archive it cannot open is worse
 /// than coming up on the empty home screen. A deleted archive is dropped the
 /// same way, so the pointer never outlives what it names.
+///
+/// The claim is taken here, not later: whichever window starts first gets the
+/// conversation, and a second one falls through to its own new session.
 fn last_session() -> Option<String> {
     let raw = std::fs::read_to_string(resume_file()).ok()?;
     let saved: Value = serde_json::from_str(&raw).ok()?;
     let session = saved.get("session").and_then(Value::as_str)?;
-    resumable_archive(session).map(|_| session.to_string())
+    resumable_archive(session)?;
+    claim_session(session).then(|| session.to_string())
 }
 
 /// Whether Ante's archive for `session` is there *and* carries the snapshot a
@@ -5312,7 +5408,22 @@ async fn session_prompt(
     State(store): State<Store>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    // Sending into a session another window is driving would append a second
+    // conversation to the same Ante log — the two windows would interleave in
+    // one transcript. Say so instead, and leave the caller's message untouched.
+    if claimed_session().is_some_and(|held| held != id) && !claim_session(&id) {
+        log_line(&format!("ante: 会话 {id} 已被另一个窗口占用，拒绝这条消息"));
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({
+                "message": format!(
+                    "Another antex window is already working in this session. Use that window, or start a new session here (/new)."
+                ),
+            })),
+        )
+            .into_response();
+    }
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
     // `steer` is what the client sends by default: typed while a turn is running
     // it goes *into* that turn (Ante's own `Ctrl+S`), otherwise it starts one.
@@ -5390,7 +5501,7 @@ async fn session_prompt(
     if delivery == "queue" {
         // Held, not handed over: it leaves the queue at the turn boundary — or
         // because the user steered/deleted it.
-        return Json(json!({ "data": item }));
+        return Json(json!({ "data": item })).into_response();
     }
 
     // Point the event pump at this session, then hand the text to Ante.
@@ -5473,7 +5584,7 @@ async fn session_prompt(
     // A session that just became live may still carry a queue from before.
     flush_queue(&store, &id).await;
 
-    Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text, "files": files, "agents": [], "skills": [] }, "delivery": delivery } }))
+    Json(json!({ "data": { "id": user_id, "sessionID": id, "type": "user", "time": { "created": now_ms() }, "payload": { "text": text, "files": files, "agents": [], "skills": [] }, "delivery": delivery } })).into_response()
 }
 
 /// The server-scoped feed. Frames are `{id, type, data}` and the first one must
@@ -6883,6 +6994,47 @@ mod tests {
         );
         // A session that is not on disk asks for nothing rather than a dead id.
         assert_eq!(reopen_choice(&args(Some("ses_nowhere"), false)), None);
+
+        restore(&guard, previous);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two windows must not end up driving the same conversation: Ante happily
+    /// resumes a session a second connection is already inside, and both then
+    /// append to one `events.jsonl`. The claim is an OS lock, so a crashed or
+    /// killed window releases it — there is no stale-lock timeout to get wrong.
+    #[test]
+    fn only_one_window_at_a_time_can_hold_a_session() {
+        let root = std::env::temp_dir().join(format!("antex-claim-{}", std::process::id()));
+        let antex_home = root.join("ante");
+        let archive = antex_home.join("sessions").join("ses_claim");
+        std::fs::create_dir_all(&archive).expect("archive dir");
+        std::fs::write(archive.join("dialog.json"), "{}").expect("snapshot");
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+
+        let guard = ISOLATED_HOME.lock().unwrap_or_else(|err| err.into_inner());
+        let previous = isolate_home(&guard, &antex_home);
+        // SAFETY: the mutex is held, so nothing else is reading these.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+
+        // This process takes the claim…
+        assert!(claim_session("ses_claim"));
+        assert_eq!(claimed_session().as_deref(), Some("ses_claim"));
+        // …and a *second* lock on the same file is refused, which is what the
+        // other window would be doing.
+        assert!(SessionClaim::take("ses_claim").is_none(), "a held session must not be reclaimable");
+        // The pointer is not offered to a window that cannot claim it: here the
+        // claim is ours, so it is offered; a different session is refused.
+        remember_resume("ses_claim");
+        assert_eq!(last_session(), Some("ses_claim".to_string()));
+
+        // Releasing it (what a clean exit does) makes it available again.
+        claimed_session();
+        if let Ok(mut held) = CLAIMED.get_or_init(|| std::sync::Mutex::new(None)).lock() {
+            *held = None;
+        }
+        assert!(claim_session("ses_claim"), "a released session can be claimed again");
 
         restore(&guard, previous);
         let _ = std::fs::remove_dir_all(&root);
