@@ -42,6 +42,8 @@ mod attachments;
 mod integrations;
 /// The sidebar's quota panel: what the client asks for over `/api/rpc`.
 mod quota;
+/// Rebuilding the snapshot Ante refuses to open after a killed turn.
+mod repair;
 /// One-command mode owns the terminal: the client must die with us, and the tty
 /// must not outlive either of them in raw mode.
 mod terminal;
@@ -125,6 +127,19 @@ fn active_model() -> (String, String) {
         .map(str::to_string)
         .unwrap_or_else(|| env_or("ANTEX_MODEL", MODEL));
     (provider, model)
+}
+
+/// The directory a session was started in, as Ante recorded it in `meta.json`.
+///
+/// Only an archive that already has a summary can answer; a killed one has no
+/// record of it at all (its log opens at the prompt), so the caller supplies the
+/// fallback.
+fn session_directory(id: &str) -> Option<String> {
+    session_meta(id)?
+        .get("dir")
+        .and_then(|v| v.as_str())
+        .filter(|dir| !dir.is_empty())
+        .map(str::to_string)
 }
 
 /// Ante's effort ladder, ascending — the wire tokens of
@@ -571,17 +586,42 @@ impl Ante {
     /// The archive [`attach_session`] may hand to `ResumeSession`: the one Ante
     /// has, and can open.
     ///
-    /// `meta.json` is what Ante writes when a turn ends, so a session killed
-    /// mid-flight leaves its directory — and its log — without it. `ResumeSession`
-    /// on such a directory comes back as `Failed to resume session: No such file
-    /// or directory (os error 2)`, a refusal the reconnect path cannot answer:
-    /// by the time it arrives the queued prompt has been handed over and is gone.
-    /// So it is treated as "no archive" — the transcript is still read back
-    /// (`archive_of` still names it, which is also what delete needs), but the
-    /// conversation restarts.
+    /// Ante writes `meta.json` and `dialog.json` only at `TurnEnd`, so a session
+    /// killed mid-flight leaves its directory — and its log — without them, and
+    /// `ResumeSession` on such a directory answers `Failed to resume session: No
+    /// such file or directory (os error 2)`. The log is intact, so the missing
+    /// pair is rebuilt from it (`repair::repair`) and the conversation continues
+    /// instead of restarting under a new id. Only an archive that cannot be
+    /// rebuilt — no log, or no prompt in it — stays unresumable.
     fn resumable_archive_of(&self, id: &str) -> Option<String> {
-        self.archive_of(id)
-            .filter(|archive| ante_home().join("sessions").join(archive).join("meta.json").is_file())
+        let archive = self.archive_of(id)?;
+        let dir = ante_home().join("sessions").join(&archive);
+        // The log never records where the session ran or on which model — a killed
+        // archive opens at the prompt itself — so both come from what this session
+        // is running now. The directory is the session's own, which is what Ante
+        // checks before it reads anything else.
+        let (provider, model) = self
+            .model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(active_model);
+        let context = repair::Context {
+            cwd: session_directory(id).unwrap_or_else(default_directory),
+            provider,
+            model,
+        };
+        match repair::repair(&dir, &context) {
+            repair::Repair::Intact => {}
+            repair::Repair::MetaOnly => {
+                log_line(&format!("ante: 补写 {archive} 的 meta.json（回合没跑完就被杀）"));
+            }
+            repair::Repair::Rebuilt => {
+                log_line(&format!("ante: 从 events.jsonl 重建 {archive} 的存档（快照与摘要都缺）"));
+            }
+            repair::Repair::NoLog => return None,
+        }
+        Some(archive)
     }
 
     /// Whether a turn is in flight, so `steer` can mean what Ante means by it.
