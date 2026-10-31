@@ -4064,19 +4064,33 @@ fn stored_session(id: &str) -> bool {
 
 /// Note that `session` is the one on screen, for the next launch to reopen.
 ///
-/// The archive has to exist: a session the client has only just invented an id
-/// for has nothing on disk yet, and `SessionStart` calls this again with the id
-/// Ante actually minted. Nothing here looks at the session's working directory —
-/// the pointer means "last looked at", and the TUI can open any archive it likes
-/// (browsing one from another project is a deliberate act, not an accident).
+/// Two things keep this honest. The archive has to exist — a session the client
+/// has only just invented an id for has nothing on disk yet, and `SessionStart`
+/// will call this again with the id Ante actually minted. And a session archived
+/// under another directory is left alone: the picker lists every archive, so
+/// browsing one from elsewhere would otherwise make every later launch of *this*
+/// directory reopen a conversation that belongs to a different project.
 fn note_open_session(session: &str) {
-    if !safe_id(session) || !ante_home().join("sessions").join(session).is_dir() {
+    if !safe_id(session) {
         return;
     }
-    remember_resume(session);
+    let archive = ante_home().join("sessions").join(session);
+    if !archive.is_dir() {
+        return;
+    }
+    let directory = launch_directory();
+    // Ante writes `dir` into `meta.json` at `TurnEnd`; a session killed before
+    // its first one has no summary and cannot be checked, so it is taken at face
+    // value rather than dropped (`session_get` cannot be reached for it either).
+    if let Some(dir) = session_meta(session).and_then(|meta| meta.get("dir").and_then(|v| v.as_str()).map(str::to_string))
+        && dir != directory
+    {
+        return;
+    }
+    remember_resume(&directory, session);
 }
 
-/// The session to reopen when the TUI starts again.
+/// The session to reopen when the TUI starts again, remembered per directory.
 ///
 /// opencode's TUI has no memory of its own across a restart: it comes up on the
 /// home screen, and the first prompt then creates a *new* session — while Ante,
@@ -4088,21 +4102,7 @@ fn note_open_session(session: &str) {
 /// this pointer and hands it to the client as `--session` on the next launch
 /// (see [`reopen_choice`]). It lives outside Ante's home: Ante rewrites what it
 /// owns, and this is not one of those (`title.txt` sits in the same spirit).
-///
-/// **There is one pointer in total, not one per directory.** An earlier version
-/// filed them per *launch* directory, which quietly broke the feature: `antex`
-/// is not always started from the project — a terminal opened in `$HOME`, or a
-/// launcher, puts it there — so the pointer written while working in
-/// `~/Projects/x` was never read on the next start, and the whole thing looked
-/// like it had not been fixed at all (2026-10-30, found right after installing
-/// the first build). One pointer matches the mental model anyway: "the session I
-/// was last looking at" is a single thing, and it is what `--continue` means in
-/// every other CLI.
-fn resume_file() -> std::path::PathBuf {
-    resume_root().join("last.json")
-}
-
-fn resume_root() -> std::path::PathBuf {
+fn resume_dir() -> std::path::PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state")))
@@ -4110,15 +4110,24 @@ fn resume_root() -> std::path::PathBuf {
         .join("antex")
 }
 
-/// Remember `session` as the one to reopen next time.
-fn remember_resume(session: &str) {
-    let path = resume_file();
+/// Where one directory's resume pointer lives. The file name is a hash of the
+/// full path, so two checkouts with the same last component cannot collide.
+fn resume_file(directory: &str) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(directory.as_bytes());
+    let tag = digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect::<String>();
+    resume_dir().join(format!("last-{tag}.json"))
+}
+
+/// Remember `session` as the one to reopen next time this directory starts.
+fn remember_resume(directory: &str, session: &str) {
+    let path = resume_file(directory);
     if let Some(parent) = path.parent()
         && std::fs::create_dir_all(parent).is_err()
     {
         return;
     }
-    let body = json!({ "session": session, "at": now_ms() });
+    let body = json!({ "directory": directory, "session": session, "at": now_ms() });
     // Written whole and renamed into place: a half-written pointer would send
     // the next launch to a session id that never existed.
     let temporary = path.with_extension("json.tmp");
@@ -4127,25 +4136,33 @@ fn remember_resume(session: &str) {
     }
 }
 
-/// The session left open last time, if Ante can still reopen it.
+/// The session this directory left open, if it can still be reopened.
 ///
-/// Only sessions with `dialog.json` are handed back: that snapshot is what
-/// `ResumeSession` restores (verified against Ante 0.3 — without it Ante answers
-/// `Failed to resume session`), and naming an archive it cannot open is worse
-/// than coming up on the empty home screen. A deleted archive is dropped the
-/// same way, so the pointer never outlives what it names.
-fn last_session() -> Option<String> {
-    let raw = std::fs::read_to_string(resume_file()).ok()?;
+/// Only sessions Ante can actually resume are handed back: without `dialog.json`
+/// (the snapshot `ResumeSession` restores, verified against Ante 0.3) Ante
+/// answers `Failed to resume session` and the first prompt then lands nowhere —
+/// worse than coming up on the empty home screen. A deleted archive is dropped
+/// the same way, so the pointer never outlives what it names.
+fn last_session(directory: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(resume_file(directory)).ok()?;
     let saved: Value = serde_json::from_str(&raw).ok()?;
+    // The file is keyed by the directory already; this also guards a copied one.
+    if saved.get("directory").and_then(Value::as_str) != Some(directory) {
+        return None;
+    }
     let session = saved.get("session").and_then(Value::as_str)?;
-    resumable_archive(session).map(|_| session.to_string())
+    safe_id(session)
+        .then(|| ante_home().join("sessions").join(session).join("dialog.json").is_file())
+        .filter(|resumable| *resumable)
+        .map(|_| session.to_string())
 }
 
-/// Whether Ante's archive for `session` is there *and* carries the snapshot a
-/// resume restores.
-fn resumable_archive(session: &str) -> Option<()> {
-    (safe_id(session) && ante_home().join("sessions").join(session).join("dialog.json").is_file())
-        .then_some(())
+/// The directory this shim was launched in — what the TUI calls its location,
+/// and the key the resume pointer is filed under.
+fn launch_directory() -> String {
+    std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| default_directory())
 }
 
 /// Session ids are a single path component. Anything else (a slash, `..`) would
@@ -5569,15 +5586,15 @@ fn probe_version(exe: &std::path::Path) -> Option<String> {
 }
 
 /// What the TUI is told to open, in order of authority: a session named on the
-/// command line, then "the newest one here" (`--continue`), then whatever was
-/// last on screen — wherever it was started from.
+/// command line, then "the newest one here" (`--continue`), then the one this
+/// directory left on screen last time.
 #[derive(Debug, PartialEq, Eq)]
 enum Reopen {
     Session(String),
     Last,
 }
 
-fn reopen_choice(args: &Args) -> Option<Reopen> {
+fn reopen_choice(args: &Args, directory: &std::path::Path) -> Option<Reopen> {
     if let Some(id) = args.session.as_deref() {
         // A bogus id would put the client on a session Ante cannot open; the
         // plain home screen is the better fallback.
@@ -5586,7 +5603,7 @@ fn reopen_choice(args: &Args) -> Option<Reopen> {
     if args.last {
         return Some(Reopen::Last);
     }
-    last_session().map(Reopen::Session)
+    last_session(&directory.to_string_lossy()).map(Reopen::Session)
 }
 
 struct Args {
@@ -5847,7 +5864,7 @@ async fn main() {
     // home screen and the first prompt creates a fresh session, so an unexpected
     // exit (crash, reboot, closed terminal) split one conversation into several
     // archives and the model lost everything above it.
-    match reopen_choice(&args) {
+    match reopen_choice(&args, &directory) {
         Some(Reopen::Session(id)) => {
             log_line(&format!("antex: 接着上次的会话 {id}"));
             command.arg("--session").arg(id);
@@ -6793,15 +6810,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The pointer must survive being pointed at an archive Ante cannot actually
-    /// resume, must not be resurrected by a stale file naming a session that has
-    /// since been deleted, and must be found **whatever directory the shim was
-    /// started from** — that last one is what broke the first build: the pointer
-    /// was filed per launch directory, so starting `antex` from `$HOME` (which is
-    /// how the terminal, a launcher, or `cd` then `antex` at home does it) never
-    /// read the one written in the project.
+    /// The pointer a restart reopens must be readable back for *its* directory
+    /// only, must survive being pointed at an archive Ante cannot actually
+    /// resume, and must not be resurrected by a stale file naming a session that
+    /// has since been deleted.
     #[test]
-    fn the_resume_pointer_names_only_resumable_archives_wherever_it_starts() {
+    fn the_resume_pointer_is_per_directory_and_only_names_resumable_archives() {
         let root = std::env::temp_dir().join(format!("antex-resume-{}", std::process::id()));
         let antex_home = root.join("ante");
         let archive = antex_home.join("sessions").join("ses_resume_pointer");
@@ -6815,23 +6829,21 @@ mod tests {
         // SAFETY: the mutex is held, so nothing else is reading these.
         unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
 
-        remember_resume("ses_resume_pointer");
+        let directory = "/home/someone/Projects/thing";
+        remember_resume(directory, "ses_resume_pointer");
         // Pointed at an archive with no `dialog.json`: Ante answers `Failed to
         // resume session`, so this must not be offered back.
-        assert_eq!(last_session(), None);
+        assert_eq!(last_session(directory), None);
+        // Another directory keeps its own answer.
+        assert_eq!(last_session("/home/someone/Projects/other"), None);
 
         // The snapshot `ResumeSession` restores is what makes it reopenable.
         std::fs::write(archive.join("dialog.json"), "{}").expect("snapshot");
-        assert_eq!(last_session(), Some("ses_resume_pointer".to_string()));
-
-        // One pointer, not one per directory: the process working directory has
-        // no say in it.
-        std::env::set_current_dir(&root).expect("cwd");
-        assert_eq!(last_session(), Some("ses_resume_pointer".to_string()));
+        assert_eq!(last_session(directory), Some("ses_resume_pointer".to_string()));
 
         // Deleting the archive drops the pointer instead of naming a ghost.
         std::fs::remove_dir_all(&archive).expect("delete archive");
-        assert_eq!(last_session(), None);
+        assert_eq!(last_session(directory), None);
 
         restore(&guard, previous);
         let _ = std::fs::remove_dir_all(&root);
@@ -6858,6 +6870,7 @@ mod tests {
         // SAFETY: the mutex is held, so nothing else is reading these.
         unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
 
+        let directory = std::path::Path::new("/home/someone/Projects/reopen");
         let args = |session: Option<&str>, last: bool| Args {
             port: 41999,
             serve_only: false,
@@ -6866,23 +6879,23 @@ mod tests {
         };
 
         // Nothing remembered yet: the client's own home screen, as before.
-        assert_eq!(reopen_choice(&args(None, false)), None);
+        assert_eq!(reopen_choice(&args(None, false), directory), None);
 
         // Remembered, and resumable: that is what comes back.
-        remember_resume("ses_reopen_a");
+        remember_resume(&directory.to_string_lossy(), "ses_reopen_a");
         assert_eq!(
-            reopen_choice(&args(None, false)),
+            reopen_choice(&args(None, false), directory),
             Some(Reopen::Session("ses_reopen_a".to_string()))
         );
 
         // `--continue` outranks it, `--session` outranks both.
-        assert_eq!(reopen_choice(&args(None, true)), Some(Reopen::Last));
+        assert_eq!(reopen_choice(&args(None, true), directory), Some(Reopen::Last));
         assert_eq!(
-            reopen_choice(&args(Some("ses_reopen_b"), false)),
+            reopen_choice(&args(Some("ses_reopen_b"), false), directory),
             Some(Reopen::Session("ses_reopen_b".to_string()))
         );
         // A session that is not on disk asks for nothing rather than a dead id.
-        assert_eq!(reopen_choice(&args(Some("ses_nowhere"), false)), None);
+        assert_eq!(reopen_choice(&args(Some("ses_nowhere"), false), directory), None);
 
         restore(&guard, previous);
         let _ = std::fs::remove_dir_all(&root);
