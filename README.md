@@ -57,6 +57,7 @@ Ante（**你自己装的**：官方脚本装、`ante update` 升级）
 | **供应商登录**（`/connect`） | Ante 的供应商登录被翻译成 opencode 的 integration 接口：`/api/integration` 由 `ante catalog` 的**合并目录**生成（每个带 `env_key` / `oauth_preset` 的 provider 就是一条）；`connect/key` 写进 `auth/api_keys.json`，`connect/oauth` 分三种——**ChatGPT 由垫片自己跑 Codex OAuth**（client id / 回调 / `codex_cli_simplified_flow` 全取自 Ante 二进制）、**Antix 交给 `ante auth login antix`**、其余（Anthropic 订阅）明确报「还没实现」。凭证落 `~/.ante/auth/`，格式与 Ante 自己写的逐字一致；`/api/credential` 的列表与删除也接上了 |
 | **模型 / 供应商列表** | 按「连得上的」喂：`/api/model`、`/api/provider` 读 `ante catalog` 的合并目录，再筛掉没凭证的（Ante 自己的 `/providers` 就是这个口径）——所以 `/connect` 签完 ChatGPT 就能在 `/models` 里选到它 |
 | **侧栏额度面板**（`▼ Quota`） | DeepSeek 余额、Command Code 的 5h/W/M + 余额、ChatGPT 订阅窗口、OpenCode Go 用量；数据垫片自己取（`src/quota.rs`），界面是自编客户端里的一块**内置插件**（`feature-plugins/sidebar/quota.tsx`）。**配过凭据的才显示**——没凭据、或凭据在但订阅用不了（401/403）的那几家整块不出现，`Unavailable` 只留给真故障。取数走 `POST /api/rpc/antex.quota/panel`（生成式 client 里唯一「任意 id + 任意方法」的通路，客户端补丁因此不必改生成代码），按 provider 缓存：成功 5 分钟、失败 60 秒，每 60 秒与每个 step 结束时刷新；凭据取环境变量 → `auth/api_keys.json`，ChatGPT 用 `/connect` 落下的 `auth/openai.json`（过期现刷、不写回）。**不装 opencode 插件**：插件那份的取数半边跑在 opencode 自己的 server 里，垫片不跑 JS（理由见 [docs/pitfalls.md](docs/pitfalls.md)） |
+| **待办**（`▼ Todo`） | 侧栏那块待办清单，数据就是 Ante 的 `TodoWrite` 工具调用本身——客户端不调接口，从消息里找**最后一次** `todowrite` 调用解析 `input.todos`（`util/todo.ts`）。两处配合才通：① 新建会话时 `StartSession.include_tools` 要 **`TodoWrite`**——Ante 0.3 的默认工具集里没有它，不显式要的话模型会直说「我没有这个工具」，而 `SessionUpdate`/`ResumeSession` 都带不了这个参数，**所以旧会话要重开才有**；② 垫片把工具名转成客户端认的小写 `todowrite`（精确匹配，不改名侧栏空、转录只剩通用键值块） |
 | **贴图** | 粘贴即发。Ante 侧有硬上限（≈240KB base64、≈170KB 原文件），垫片先压到 160KB 以内，压不下就明说 |
 | **断线重连** | 退避重连 + `/api/health` 说真话 + 转录里一行说明，掉线期间排队的消息不丢。**回合没跑完就被杀掉的会话照样接着聊**：Ante 只在 `TurnEnd` 写 `meta.json`/`dialog.json`，被杀时盘上只剩 `events.jsonl`，`ResumeSession` 会回 `Failed to resume session`——垫片按缺什么补什么（`src/repair.rs`）：只缺摘要就补 `meta.json`、Ante 自己那份 `dialog.json` 原样留着；两份都缺才从日志重建对话；`dir`/模型日志里没有，取本会话当前的值（Ante 会查 `session cwd does not exist`）。只有日志里一条提示都没有时才真的回落到新开一条 |
 | **终端不会被占住** | 一体化模式下垫片被信号杀死、或客户端自己崩掉，终端都会回到可用的 shell：可捕获的信号（`TERM`/`INT`/`HUP`/`QUIT`）由垫片转给客户端，客户端自己把 raw mode 放回去；连 `SIGKILL` 也管得住——Linux 上客户端被 `PR_SET_PDEATHSIG` 绑在垫片上，内核替我们发信号（**macOS 没有这个机制，`SIGKILL` 那条仍会留孤儿**）。垫片另存一份 termios 兜底。**修之前**客户端会变成孤儿霸着 tty、停在 `Connection lost…` 覆盖层，而且 raw mode 下 `ISIG` 关着，**Ctrl+C 也不产生信号** |
@@ -177,7 +178,6 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 **空框 = 待定（做得到、还没做）；删除线 = 遗弃（Ante 底层没这个概念，别再提议硬做）。**已实现的部分在[功能](#功能)一节，逐条实现细节与验证法在 [docs/implementation.md](docs/implementation.md)。
 
 ### 待定
-
 - [ ] 会话内 `/cd` —— **Ante 没有换目录的接口**：目录在建会话时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有这个字段。会话内 `/cd` 走 `POST /api/session/{id}/move`，垫片回 400 + 一句「新建一个会话」的提示，TUI 原样弹在 toast 里；**没开会话时**的 `/cd` 是纯客户端行为（换的是界面目录），照常可用。退一步是「按新目录重开会话」（丢历史、会话列表多一行）
 - [ ] `/fork` —— **做得到、还没做**：Ante 有 `Op::ForkSession` / `Evt::SessionForked`（附带 `SessionInfo.forked_from`）。客户端走 `POST /api/session/{id}/fork`（`before` ＝ 从哪条输入切），对应 op 的 `at`；fork 出来的是**新会话、不自动开始**，界面要跳到它（`/fork` 的导航语义）
 - [ ] 真多标签（session tabs）—— **待定**：先验证 Ante 侧能否并发驱动多条会话，再谈垫片改造（现在只是把入口临时关掉）
@@ -192,7 +192,7 @@ macOS 那份**只能在 macOS 上编**：垫片要 Apple SDK（Linux 上交叉�
 - [ ] ~~`/plugins`、`/btw`~~ —— 无 opencode 插件系统；`/btw` 要的是「旁问」的独立 generate op
 - [ ] ~~`/reload`、`/update`、`/restart`、`Ctrl+B` 后台化工具~~ —— 重新加载服务端配置 / 更新 opencode / 把工具调用扔后台，对 Ante 都无意义（**暂时遗弃**：等哪天有对应 op 再说）
 - [ ] ~~LSP、formatter~~ —— 无对应概念，打桩显示为空（入口已摘；**暂时遗弃**）
-- [ ] ~~子代理面板 / 点进子代理~~ —— 客户端的子代理 UI（内联块点进去看子会话、composer 的 subagents tab、mini 的 footer inspector）**整套都挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流 + `sessionFamily()`）。Ante 没有这个概念：子代理只是父会话里的一次 `Agent` 工具调用，**内部活动不推给前端**（`ToolUpdate` 只在子代理排队等 slot 时才发，会话日志里基本没有），结果只在 `ToolEnd.result_json.report` 里一次交付；协议里也没有 agent id / parent turn（`SessionInfo.subagents` 只是可委派清单）。硬造 child session 只有空壳，还会污染会话列表。能做的只有把 `Agent` 调用按客户端的 subagent 块渲染（已做）
+- [ ] ~~子代理面板 / 点进子代理~~ —— 客户端的子代理 UI（内联块点进去看子会话、composer 的 subagents tab、mini 的 footer inspector）**整套都挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流 + `sessionFamily()`）。Ante 没有这个概念：子代理只是父会话里的一次 `Agent` 工具调用，**内部活动不推给前端**（`ToolUpdate` 只在子代理排队等 slot 时才发，会话日志里基本没有），结果只在 `ToolEnd.result_json.report` 里一次交付；协议里也没有 agent id / parent turn（`SessionInfo.subagents` 只是可委派清单）。硬造 child session 只有空壳，还会污染会话列表。能做的只有把 `Agent` 调用按客户端的 subagent 块渲染（已做）。**2026-11-02 实测复核**：全部历史会话里 `ToolUpdate` 共 **0 条**，`Agent` 调用期间只发 `UsageUpdate`（并发数、步数），一个字的正文都没有——所以「点进去看子会话」不是缺垫片代码，是上游根本不送数据
 
 ## 依赖与版本
 
