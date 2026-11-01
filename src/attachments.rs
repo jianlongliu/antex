@@ -74,51 +74,92 @@ pub fn stage(text: &str, files: &[Value]) -> (String, Vec<Value>, Vec<String>) {
     (sent, echo, dropped)
 }
 
+/// Pull `(bytes, mime)` out of whatever shape the client sent.
+///
+/// 2.0.x sent `{uri: "data:<mime>;base64,<data>", name}` and that is what this
+/// used to read. 2.2.5 sends `{data, mime, source, mention}`, where `source` is
+/// `{type:"inline"}` for a paste or `{type:"uri", uri}` for a file the client
+/// left on disk — so the payload moved out of `uri` and the old reader matched
+/// nothing, silently dropping every pasted image (2026-11-02).
+fn payload(file: &Value) -> Option<(String, String)> {
+    let name = file.get("name").and_then(Value::as_str).unwrap_or("");
+
+    // 2.2.5: `data` holds raw base64 and `mime` names the type beside it.
+    if let Some(data) = file.get("data").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+        let mime = file
+            .get("mime")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("application/octet-stream");
+        // `data` is a payload, not a data: URL; wrap it so `decode_data_url`
+        // stays the single decoder for both shapes.
+        return Some((format!("{mime};base64,{data}"), mime.to_string()));
+    }
+
+    // 2.2.5: a remote/local server gets `source: {type:"uri", uri}` instead.
+    let uri = file
+        .get("uri")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            file.get("source")
+                .and_then(|s| s.get("uri"))
+                .and_then(Value::as_str)
+        })
+        .filter(|uri| !uri.is_empty())?;
+
+    let rest = uri.strip_prefix("data:")?;
+    let mime = rest.split([';', ',']).next().unwrap_or("application/octet-stream");
+    let _ = name;
+    Some((rest.to_string(), mime.to_string()))
+}
+
 /// `Ok(None)` is "nothing to do with this one" — a URI we are not meant to
 /// fetch, or a file type Ante has no way to read. `Err` is worth a log line.
 fn stage_one(file: &Value) -> Result<Option<(Value, Option<String>)>, String> {
-    let Some(uri) = file
-        .get("uri")
-        .and_then(Value::as_str)
-        .filter(|uri| !uri.is_empty())
-    else {
-        return Ok(None);
+    let Some((rest, _uri_mime)) = payload(file) else {
+        // Not an inline payload: a `file://` URL the client already mentions in
+        // the text, which Ante reads on its own.
+        let name = file.get("name").and_then(Value::as_str).unwrap_or("");
+        let path = file
+            .get("uri")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                file.get("source")
+                    .and_then(|s| s.get("uri"))
+                    .and_then(Value::as_str)
+            })
+            .and_then(file_path);
+        return match path {
+            Some(path) => stage_local(Path::new(&path), name),
+            None => Ok(None),
+        };
     };
     let name = file.get("name").and_then(Value::as_str).unwrap_or("");
-    if let Some(rest) = uri.strip_prefix("data:") {
-        let (mime, bytes) = decode_data_url(rest, name)?;
-        if bytes.len() > MAX_RAW_BYTES {
-            return Err(format!("{name} is over {} MB", MAX_RAW_BYTES / 1024 / 1024));
+    let (mime, bytes) = decode_data_url(&rest, name)?;
+    if bytes.len() > MAX_RAW_BYTES {
+        return Err(format!("{name} is over {} MB", MAX_RAW_BYTES / 1024 / 1024));
+    }
+    match kind(&mime) {
+        // A pasted image travels as a mention: Ante turns that into an image
+        // attachment, which is the only channel its protocol has.
+        Kind::Image => {
+            let Some(prepared) = prepare(bytes, &mime) else {
+                return Err(format!("{name} is not a decodable image"));
+            };
+            let path = write_staged(&prepared, name)?;
+            let entry = entry(&prepared.bytes, &prepared.mime, name, None);
+            Ok(Some((entry, Some(mention(&path)))))
         }
-        return match kind(&mime) {
-            // A pasted image travels as a mention: Ante turns that into an image
-            // attachment, which is the only channel its protocol has.
-            Kind::Image => {
-                let Some(prepared) = prepare(bytes, &mime) else {
-                    return Err(format!("{name} is not a decodable image"));
-                };
-                let path = write_staged(&prepared, name)?;
-                let entry = entry(&prepared.bytes, &prepared.mime, name, None);
-                Ok(Some((entry, Some(mention(&path)))))
-            }
-            // Text and PDFs: Ante reads a mention of these as file content, so
-            // the same mention is all that is needed.
-            Kind::Text => {
-                let ext = extension(&mime);
-                let path = write_raw(&bytes, ext, name, "file")?;
-                let entry = entry(&bytes, &mime, name, None);
-                Ok(Some((entry, Some(mention(&path)))))
-            }
-            Kind::Other => Err(format!("{name} has type {mime}, which Ante cannot read")),
-        };
+        // Text and PDFs: Ante reads a mention of these as file content, so the
+        // same mention is all that is needed.
+        Kind::Text => {
+            let ext = extension(&mime);
+            let path = write_raw(&bytes, ext, name, "file")?;
+            let entry = entry(&bytes, &mime, name, None);
+            Ok(Some((entry, Some(mention(&path)))))
+        }
+        Kind::Other => Err(format!("{name} has type {mime}, which Ante cannot read")),
     }
-    // `file://` attachments are files the client already points at in the text
-    // (`@path`), so Ante reads them without help from us. The entry is still
-    // echoed, because the client's transcript renders the server's copy.
-    if let Some(path) = file_path(uri) {
-        return stage_local(Path::new(&path), name);
-    }
-    Ok(None)
 }
 
 /// A `file://` attachment: no mention to add, but the client still wants the
@@ -627,6 +668,48 @@ mod tests {
             .expect("base64");
         assert_eq!(decoded, std::fs::read(&path).expect("read staged"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 2.2.5 moved the payload: `uri` became `data` + `mime` + `source`, and
+    /// the old reader matched nothing, so every pasted image was dropped
+    /// without a word (2026-11-02). Both shapes must stage the same way.
+    #[test]
+    fn the_newer_attachment_shape_stages_like_the_old_one() {
+        let bytes = png(32, 32);
+        let legacy = stage("看图", &[data_url("image/png", &bytes)]);
+
+        let newer = json!({
+            "data": encode(&bytes),
+            "mime": "image/png",
+            "source": { "type": "inline" },
+            "name": "clipboard",
+            "mention": { "start": 0, "end": 2, "text": "看图" },
+        });
+        let (sent, echo, dropped) = stage("看图", &[newer]);
+
+        assert!(dropped.is_empty(), "the 2.2.5 shape must not be dropped: {dropped:?}");
+        assert_eq!(echo.len(), 1, "the attachment has to be echoed back");
+        assert_eq!(echo[0]["mime"], "image/png");
+        assert_eq!(echo[0]["source"], json!({ "type": "inline" }));
+        let token = sent.split_whitespace().last().expect("mention");
+        assert!(token.starts_with("@/"), "Ante only takes images by mention: {token}");
+
+        // Same content in, same size out: neither path may mangle the bytes.
+        let old = base64::engine::general_purpose::STANDARD
+            .decode(legacy.1[0]["data"].as_str().expect("legacy data"))
+            .expect("base64");
+        let new = base64::engine::general_purpose::STANDARD
+            .decode(echo[0]["data"].as_str().expect("new data"))
+            .expect("base64");
+        assert_eq!(old, new);
+
+        for sent in [legacy.0, sent] {
+            if let Some(token) = sent.split_whitespace().last()
+                && let Some(path) = token.strip_prefix('@')
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     #[test]
