@@ -237,6 +237,16 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **`--help` 全英文**，并写明客户端子命令归客户端（`serve` / `service` / `upgrade` / `uninstall` 走的是官方 opencode，不是垫片）。错误参数 = 一行 `error: …` + 整份 help + `exit 2`，都走 stderr。
 - **`antex-tui --version` 的假串也治了**：根因在上游 `packages/script/src/index.ts`——没给 `OPENCODE_VERSION`、channel 又不是 `latest` 时它自己拼 `0.0.0-<channel>-<时间戳>`。`script/build-tui.sh` 现在把 vendor 的版本喂进去，**在下次重建客户端时生效**；本版没重建，所以包里的 `antex-tui --version` 仍是旧串，`antex --version` 已经绕开它。
 
+**`2026.11.02rc2`：贴图修好（2.2.5 换了附件形状）**
+
+- **症状**：升级到 2.2.5 后粘贴图片**静默失效**——`files` 回来是空数组、模型说「没看到图片」、垫片日志一行都没有。
+- **根因**：`attachments::stage_one` 只认 2.0.x 的 `{uri: "data:<mime>;base64,…", name}`。2.2.5 改成 `PromptFileAttachment = {data, mime, source, mention}`，`source` 是 `{type:"inline"}`（粘贴）或 `{type:"uri", uri}`（客户端留在盘上的文件）。旧代码 `file.get("uri")` 两头都取不到，返回 `Ok(None)`——「没事可做」，连日志都不写。
+- **修法**：新增 `payload()` 把三种形状归一成一个 `data:<mime>;base64,…` 串，交给原来的 `decode_data_url` 当唯一解码口；下载/压缩/落盘/提及那段原样不动。**剪贴板粘贴仍走 `uri` 那条**（`pasteAttachment()` 建的是 `{uri, name, path, mention}`），所以两种形状都得留着。
+- **2.2.5 的一条客户端规矩**：附件必须带 `mention` 锚点，否则 `syncExtmarksWithPromptParts()` 里 `if (!part?.mention) continue` 直接跳过，请求里压根不会出现这个文件——排查时要知道「文件没发出去」可能不是垫片的问题。
+- **验证**：`cargo test` 69 项全过（新增 `the_newer_attachment_shape_stages_like_the_old_one`，钉住新旧形状产出同样的 base64 与同一个 `@路径` 提及）；端到端两种形状都是 `files echoed: 1`、日志 `attachments: 暂存 1 个附件`、缓存落盘、消息送达。
+
+**已知未修（报上游，不在本仓范围内）**：`Windows Terminal → ssh → macOS` 下启动 antex，输入框会带出 `:ffff/ffff/ffff:eeee/ffff/ffff`。那是 Windows Terminal 对 `OSC 10/11` 颜色查询的回复（`\x1b]10;rgb:ffff/ffff/ffff\x07`）在跨 SSH 包边界时被 opentui 的终端解析器**部分消费**，吃掉 `\x1b]10;rgb` 前缀后残尾漏进了输入流。同机 Omarchy/herdr 链路正常，本地 PTY 也正常；opentui **0.8.0 与 0.8.1 这块代码逐字相同**，上游未修。手上有完整字节流（`OTUI_STDIN_LOG` 抓的）可复现。
+
 **`2026.11.02rc1`：上游 opencode 2.0.29 → 2.2.5（opentui 0.5.17 → 0.8.0），待办面板转正**
 
 - **跨了 1381 个提交**，11 处客户端补丁全部存活，只有 4 个文件冲突（`builtins.ts`、`dialog-model.tsx`、`client/solid/data.ts`、`cli/package.json`）。冲突的共同形态是「上游在同几行加了新能力」，解法一律是取上游新字段、只留我们那句判断；详细逐条见 [client-patches.md](client-patches.md) 那份「2026-11-02 实测结论」。
