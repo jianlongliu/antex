@@ -87,8 +87,11 @@ Ante 没有 VCS/diff、分享、PTY（**MCP 与 undo/redo 已于 2026-10-22 转�
 
 | 命令 | 解析到 | 说明 |
 | --- | --- | --- |
-| `~/.local/bin/antex-tui` | `vendor/opencode/packages/cli/dist/cli-linux-x64/bin/opencode` | **我们的构建**，`antex` 默认用它；版本显示 `0.0.0-master-<日期>`；随时可用 `./script/build-tui.sh` 重建 |
+| `~/.local/bin/antex-tui` | `vendor/opencode/packages/cli/dist/cli-<os>-<arch>/bin/opencode` | **我们的构建**，`antex` 默认用它；`antex-tui --version` 报的是喂进去的上游版本（如 `opencode v2.2.5`）；随时可用 `./script/build-tui.sh` 重建 |
 | `opencode` / `opencode2` | `~/.opencode/bin/…` | 官方 2.0.18，**留作兜底**：`ANTEX_CLIENT=opencode2 antex`，或删掉 `antex-tui` 软链即回退 |
+
+- **产物目录名跟着平台走**（`cli-linux-x64`、`cli-darwin-arm64`…）。`script/build-tui.sh` 以前把它写死成 `cli-linux-x64`，在 arm64 Mac 上编完软链就指向不存在的路径，症状是 `antex` 一启动就 `No such file or directory`。现在按 `uname` 拼，找不到时把 `dist` 里实有的目录打出来。
+- **`~/.local/bin` 里的二进制拷过去可能被 SIGKILL**（rc=137）：macOS 会追加 `com.apple.provenance`。用 `install -m 755` 并 `xattr -c` 清一遍，别直接 `cp`。
 
 - **官方那份别删**：`~/.opencode/bin` 是官方脚本的安装位置（删掉就没有官方 v2 可回退了）。
 - 升级官方用 `opencode upgrade`（自带）；我们那份随 `git subtree pull` + `./script/build-tui.sh` 跟上。
@@ -130,6 +133,16 @@ cd - && ./script/build-tui.sh
 
 跑起来看界面有没有坏——**垫片假装的是接口，上游改了接口既不会有合并冲突、也不会有类型检查**，
 只能靠「拿真客户端跑一遍」当场发现。这是本方案唯一的防漂移手段，别省。
+
+**2026-11-02 那次升级（2.0.29 → 2.2.5，opentui 0.5.17 → 0.8.0）的实测结论**，下次照着看：
+
+- 4 个文件冲突（`builtins.ts`、`dialog-model.tsx`、`client/solid/data.ts`、`cli/package.json`），其余 7 处补丁自动重合。冲突的共同形态是**上游在同几行加了新能力**（`SidebarLimit`、`newDesigns()` 分支、重读保护），解的时候取上游新字段、只留我们那句判断。
+- **`data.ts` 的两处补丁要盯紧**：上游后来也加了「重读不抹本地行」，但只保留 `outbox`/`admitted` 的行、并一律追加到末尾。我们的版本更宽（连客户端自己折出来的 idle/compaction/流式中行也保留）且按 `time.created` 归位，**别被上游那版覆盖掉**。同时要接住上游新增的 `stored()` / `evictMissing` / `deletionEpoch`。
+- **接口漂移的两个真坑**，都不报错、只在界面上炸：
+  - `GET /api/experimental/usage/limits`：客户端当 `UsageLimitsInfo | null` 读，通用 fallback 答 `data: []` 会让模型选择器崩在 `t.budgets.flatMap`。垫片已加显式路由答 `null`。
+  - 产物目录改名（见上面「客户端现状」）。
+- **`cli.json` 那两层还会丢**：本机那份升完只剩 `theme`/`session`，`plugins` 与 `keybinds` 都没了，`/btw`、`/diff`、`/plugins` 直接回到面板。**每次升级后都要重写一遍**。
+- **验收入口**：`/tmp` 那份探针（`tui_drive.py` 的 SIGKILL 版）比仓库里那个稳——仓库版用 SIGTERM 收尾再 `waitpid`，而客户端在持有终端时不响应 SIGTERM，会永久挂住。
 
 （网络：本机代理在路由器上做透明转发，`git subtree pull` 与 `bun` 直连即可；两个脚本会先看本地 `7890` 有没有在监听，只有本地 mihomo 在跑时才设代理。GitHub 拉不动时**先换代理节点**，别急着怀疑 git。）
 

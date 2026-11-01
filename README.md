@@ -7,12 +7,12 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Arch%20%7C%20macOS-4b5563)](#装包ci-产物)
 [![rustc](https://img.shields.io/badge/rustc-1.99.1%20%C2%B7%20edition%202024-dea584)](#依赖与版本)
-[![client](https://img.shields.io/badge/opencode-v2%20%2F%202.0.29-111827)](#依赖与版本)
+[![client](https://img.shields.io/badge/opencode-v2%20%2F%202.2.5-111827)](#依赖与版本)
 
 ![antex 首页](docs/home.png)
 
 
-> 最后核对：2026-10-22 · 目标客户端 opencode 2.0.29 · Rust 1.99.1
+> 最后核对：2026-11-02 · 目标客户端 opencode 2.2.5（opentui 0.8.0）· Rust 1.99.1
 
 ---
 
@@ -225,8 +225,8 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | 项 | 说明 |
 | --- | --- |
 | 网络 | 本机现在**直连即可**（代理在路由器上做透明转发）。若哪天又只用本地 mihomo，再 `export http_proxy=https_proxy=http://127.0.0.1:7890`——`script/*.sh` 已改成「只有 7890 真在监听才设代理」 |
-| opencode 客户端 | **2.0.29**，来自本仓库 `vendor/opencode/`（subtree 上游 tag `v2.0.29`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
-| 跟上游的口子 | `./script/upgrade-upstream.sh [ref]`——默认跟上游**主线**（默认分支 `dev`），也可传 tag（如 `v2.0.29`）。**原先跟的 `v2` 分支 2026-10-10 停更了**（版本停在 2.0.26），别再拿它当上游 |
+| opencode 客户端 | **2.2.5**，来自本仓库 `vendor/opencode/`（subtree 上游 tag `v2.2.5`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
+| 跟上游的口子 | `./script/upgrade-upstream.sh [ref]`——默认跟上游**主线**（默认分支 `dev`），也可传 tag（如 `v2.2.5`）。**原先跟的 `v2` 分支 2026-10-10 停更了**（版本停在 2.0.26），别再拿它当上游 |
 | Ante | 接后端时用 **`ante-sdk` 0.2.14**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.14"`（`^0.2.14`，跟着 Ante 的 0.2.x 走）。实测对着 Ante **0.2.14**；启动自检会比对两边的次版本号 |
 
 ## 目录结构

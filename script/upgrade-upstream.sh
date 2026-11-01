@@ -10,7 +10,7 @@
 # 版本走就显式传 tag：
 #
 # 用法：./script/upgrade-upstream.sh            # 主线最新（dev）
-#       ./script/upgrade-upstream.sh v2.0.29    # 某个已发布的 tag
+#       ./script/upgrade-upstream.sh v2.2.5    # 某个已发布的 tag
 set -eu
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"

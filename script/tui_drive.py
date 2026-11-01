@@ -89,7 +89,29 @@ def run(cmd: str, cols: int, rows: int, sends: list[tuple[float, str]], after: f
                 break
             stream.feed(chunk)
     finally:
+        # The client keeps writing to the pty until the very end, and on macOS
+        # a child still holding a blocked write is not reapable: SIGKILL alone
+        # left `waitpid` blocked forever, so the probe appeared to hang with no
+        # output at all (2026-11-02). Drain and close the pty first, then kill
+        # and reap; SIGTERM is tried first because a cooperative exit keeps the
+        # terminal sane.
         os.kill(pid, 15)
+        for _ in range(20):
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                os.close(fd)
+                return screen
+            time.sleep(0.1)
+        try:
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0)
+                if not ready:
+                    break
+                if not os.read(fd, 65536):
+                    break
+        except OSError:
+            pass
+        os.close(fd)
+        os.kill(pid, 9)
         os.waitpid(pid, 0)
     return screen
 
