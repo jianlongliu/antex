@@ -1,12 +1,12 @@
 <div align="center">
 
-# ANTEX
+# ANTEX = ANTE + OPENTUI
 
-**Run opencode's TUI on top of the [Ante](https://github.com/AntigmaLabs/ante) agent backend.**
-**把 opencode 自带的 TUI 接到 [Ante](https://github.com/AntigmaLabs/ante) 后端上跑。**
+**Ante's agent backend, wearing OpenTUI's interface.**
+**Ante 的智能体后端，穿 OpenTUI 的界面。**
 
-Interface, theme and keybindings come from opencode; every byte of data comes from Ante.
-界面、主题、键位全部来自 opencode；所有数据来自 Ante。
+Interface, theme and keybindings come from OpenTUI; every byte of data comes from Ante.
+界面、主题、键位来自 OpenTUI；所有数据来自 Ante。
 
 [![release](https://img.shields.io/github/v/release/jianlongliu/antex?label=release&color=2f81f7)](https://github.com/jianlongliu/antex/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -48,7 +48,7 @@ Interface, theme and keybindings come from opencode; every byte of data comes fr
 ## What it is
 
 ```
-opencode's TUI (built from this repo, logo replaced)   ← interface
+OpenTUI (opencode's interface, built from this repo)   ← interface
         ↕  opencode protocol (implemented here — the "shim")
 antex (this repo, one binary)
         ↕  ante-sdk / `ante serve --stdio`
@@ -62,7 +62,7 @@ The only coupling is the protocol. If Ante changes it, the fix is usually a bump
 ## 这是什么
 
 ```
-opencode 的 TUI（本仓库自己编的，换了 logo）   ← 界面
+OpenTUI（opencode 的界面，本仓库自己编的）   ← 界面
         ↕  opencode 协议（本仓库实现的「垫片」）
 antex（垫片，本仓库，一个二进制）
         ↕  ante-sdk / `ante serve --stdio`
