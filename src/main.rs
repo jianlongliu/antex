@@ -3979,6 +3979,19 @@ async fn empty_reads() -> Json<Value> {
     envelope(json!([]))
 }
 
+/// `/api/experimental/usage/limits`: OpenCode Console's budgets.
+///
+/// The client types this as `UsageLimitsInfo | null` and reads `info.budgets`
+/// straight through, so the generic fallback's `data: []` (an array where an
+/// object is expected) left `budgets` undefined and crashed the model picker
+/// with `undefined is not an object (evaluating 't.budgets.flatMap')`.
+/// `null` is the client's own "not signed in to Console" answer: it unsets the
+/// budget rows and the `▼ Limit` card without asking any further questions.
+/// Ante has no Console workspace, so that is the honest reply.
+async fn usage_limits() -> Json<Value> {
+    envelope(json!(null))
+}
+
 /// `/api/session/active` and friends: the client's submit path reads
 /// `.info.project.id`, so a bare empty envelope makes it throw.
 async fn active_session() -> Json<Value> {
@@ -5640,6 +5653,7 @@ async fn main() {
         )
         .route("/api/experimental/migration/v1", get(migration))
         .route("/api/experimental/capabilities", get(empty_reads))
+        .route("/api/experimental/usage/limits", get(usage_limits))
         .route("/api/experimental/session/stats", get(session_stats))
         .route("/api/experimental/session/{id}/export", get(session_export))
         .route("/api/session", get(sessions_list).post(session_create))

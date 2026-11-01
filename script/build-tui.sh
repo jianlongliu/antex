@@ -59,7 +59,16 @@ echo "客户端版本：opencode $OPENCODE_VERSION"
 cd "$repo/vendor/opencode/packages/cli"
 bun run script/build.ts --single --skip-web-ui
 
-built="$repo/vendor/opencode/packages/cli/dist/cli-linux-x64/bin/opencode"
+# 产物目录名跟着平台走（上游 2.2.x 起是 `cli-<os>-<arch>`），以前这里把
+# `cli-linux-x64` 写死了：在 arm64 Mac 上编出来的是 `cli-darwin-arm64`，
+# 软链就指向一个不存在的路径，`antex` 一启动就 "No such file or directory"。
+built="$repo/vendor/opencode/packages/cli/dist/cli-$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)/bin/opencode"
+if [ ! -x "$built" ]; then
+  echo "构建产物没找到：$built" >&2
+  echo "dist 里实际有：" >&2
+  ls "$repo/vendor/opencode/packages/cli/dist" >&2
+  exit 1
+fi
 ln -sfn "$built" "$HOME/.local/bin/antex-tui"
 echo "好了：~/.local/bin/antex-tui -> $built"
 echo "（antex 默认用它；想临时切回官方二进制：ANTEX_CLIENT=opencode2 antex）"
