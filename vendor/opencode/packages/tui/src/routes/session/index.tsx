@@ -3327,27 +3327,53 @@ function Subagent(props: ToolProps) {
     const id = sessionID()
     return props.part.state.status === "running" || Boolean(id && data.session.status(id) === "running")
   })
+  // What the subagent said last. Ante pushes each line through
+  // `session.tool.progress` (its `Evt::ToolUpdate`), which lands in
+  // `state.metadata.progress`; upstream never sets it, so this only shows when
+  // a shim feeds it.
+  //
+  // Deliberately kept after the call finishes: a fast subagent emits its line
+  // and its `ToolEnd` in the same tick, so gating on `isRunning()` left the
+  // window shorter than one render and nothing ever appeared (measured
+  // 2026-11-02). The header's ✓ already says it is done.
+  const progress = createMemo(() => {
+    const raw = stringValue(props.metadata.progress)?.trim()
+    if (!raw) return undefined
+    return raw.split("\n").map((line) => line.trim()).filter(Boolean).pop() || undefined
+  })
+  const theme = useTheme()
 
   return (
-    <InlineTool
-      icon={isRunning() ? "│" : continuation() ? "↳" : props.part.state.status === "completed" ? "✓" : "│"}
-      spinner={isRunning()}
-      running={isRunning()}
-      complete={description()}
-      pending="Delegating…"
-      part={props.part}
-      onClick={() => {
-        const id = sessionID()
-        if (id) navigate({ type: "session", sessionID: id })
-      }}
-      status={
-        isBackgroundSubagent(props.metadata, props.part.state.status) ? (
-          <StatusBadge>Background</StatusBadge>
-        ) : undefined
-      }
-    >
-      {`${continuation() ? "Continue subagent" : `${Locale.titlecase(stringValue(props.input.agent) ?? stringValue(props.input.subagent_type) ?? "General")} Subagent`} — ${description() ?? "Subagent"}${model() ? ` · ${model()}` : ""}`}
-    </InlineTool>
+    <box flexDirection="column">
+      <InlineTool
+        icon={isRunning() ? "│" : continuation() ? "↳" : props.part.state.status === "completed" ? "✓" : "│"}
+        spinner={isRunning()}
+        running={isRunning()}
+        complete={description()}
+        pending="Delegating…"
+        part={props.part}
+        onClick={() => {
+          const id = sessionID()
+          if (id) navigate({ type: "session", sessionID: id })
+        }}
+        status={
+          isBackgroundSubagent(props.metadata, props.part.state.status) ? (
+            <StatusBadge>Background</StatusBadge>
+          ) : undefined
+        }
+      >
+        {`${continuation() ? "Continue subagent" : `${Locale.titlecase(stringValue(props.input.agent) ?? stringValue(props.input.subagent_type) ?? "General")} Subagent`} — ${description() ?? "Subagent"}${model() ? ` · ${model()}` : ""}`}
+      </InlineTool>
+      <Show when={progress()}>
+        {(line) => (
+          <box paddingLeft={INLINE_TOOL_ICON_WIDTH + 3} flexShrink={0}>
+            <text fg={theme.text.muted} wrapMode="none">
+              {line()}
+            </text>
+          </box>
+        )}
+      </Show>
+    </box>
   )
 }
 

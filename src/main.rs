@@ -2809,6 +2809,21 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     store.publish_located("form.created", json!({ "form": form }));
                 }
             }
+            // A line the tool itself said while still running — for an `Agent`
+            // call this is the subagent's own output as it arrives. The
+            // client's `session.tool.progress` puts it in `state.metadata`,
+            // which the subagent cell now renders under its header.
+            Evt::ToolUpdate(update) => {
+                store.publish(
+                    "session.tool.progress",
+                    json!({
+                        "sessionID": session,
+                        "assistantMessageID": message_id,
+                        "id": update.tool_use_id,
+                        "metadata": { "progress": update.message },
+                    }),
+                );
+            }
             Evt::ToolEnd(end) => {
                 let failed = !matches!(end.status, ante_sdk::protocol::ToolEndStatus::Completed);
                 let text = result_text(&end.result_json);
