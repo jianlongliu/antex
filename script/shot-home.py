@@ -26,7 +26,28 @@ from collections import Counter
 import pyte
 
 # Ghostty's own font, so the picture matches what the user actually sees.
+#
+# A bare family name only resolves when the host has fontconfig data that
+# ImageMagick can read. Homebrew's `magick` on macOS often has none — then
+# `-list font` is empty and every Pango call fails with exit status 1. Passing
+# the font file itself works either way, so prefer that when it exists.
 FONT = "GoogleSansCode Nerd Font Mono"
+
+
+def resolve_font() -> str:
+    """The font file if it is installed, else the family name."""
+    candidates = [
+        os.path.expanduser(f"~/Library/Fonts/GoogleSansCode[wght].ttf"),
+        "/Library/Fonts/GoogleSansCode[wght].ttf",
+        os.path.expanduser("~/.local/share/fonts/GoogleSansCode[wght].ttf"),
+        "/usr/share/fonts/TTF/GoogleSansCode[wght].ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return FONT
+
+
 FALLBACK_FG = "#d8dee9"
 FALLBACK_BG = "#1e1e2e"
 
@@ -63,7 +84,28 @@ def capture(cmd: str, cols: int, rows: int, wait: float) -> pyte.Screen:
                 break
             stream.feed(chunk)
     finally:
+        # Same trap as `tui_drive.py`: the client keeps writing to the pty until
+        # the end, and on macOS a child still blocked in that write is not
+        # reapable — SIGTERM alone left `waitpid` hanging forever, so this
+        # script appeared to run and then never produced a PNG (2026-11-02).
+        # Drain and close the pty first, then kill and reap.
         os.kill(pid, 15)
+        for _ in range(20):
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                os.close(fd)
+                return screen
+            time.sleep(0.1)
+        try:
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0)
+                if not ready:
+                    break
+                if not os.read(fd, 65536):
+                    break
+        except OSError:
+            pass
+        os.close(fd)
+        os.kill(pid, 9)
         os.waitpid(pid, 0)
     return screen
 
