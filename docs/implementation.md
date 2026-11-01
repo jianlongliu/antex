@@ -237,6 +237,13 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **`--help` 全英文**，并写明客户端子命令归客户端（`serve` / `service` / `upgrade` / `uninstall` 走的是官方 opencode，不是垫片）。错误参数 = 一行 `error: …` + 整份 help + `exit 2`，都走 stderr。
 - **`antex-tui --version` 的假串也治了**：根因在上游 `packages/script/src/index.ts`——没给 `OPENCODE_VERSION`、channel 又不是 `latest` 时它自己拼 `0.0.0-<channel>-<时间戳>`。`script/build-tui.sh` 现在把 vendor 的版本喂进去，**在下次重建客户端时生效**；本版没重建，所以包里的 `antex-tui --version` 仍是旧串，`antex --version` 已经绕开它。
 
+**`2026.11.02rc3`：子代理能看见在说什么；额度面板交给 Ante；README 重写**
+
+- **子代理进度**：Ante 一直推 `Evt::ToolUpdate`（`{tool_use_id, seq, message}`），垫片以前直接丢掉，于是子代理块只有一个转圈。现在转成 `session.tool.progress` 放进 `metadata.progress`，客户端 `Subagent` 块在标题下面多画一行。**反直觉的一点：那行跑完也留着**——第一版按 `isRunning()` 门控，快子代理在同一 tick 发完 `ToolUpdate` 和 `ToolEnd`，窗口比一帧还短，屏上永远看不到（实测三次）。标题的 ✓ 已经说明跑完了。
+- **额度面板的 ChatGPT 行改用 `ante usage --json`**：以前自己打 `chatgpt.com/backend-api/wham/usage`，等于把 Ante 已经做的事又做一遍——token 刷新、`ChatGPT-Account-Id` 头、多账号挑法，每一处都可能漂开。净删 79 行。**非零退出不等于没数据**：Ante 有账号过期时退出码 1 但仍打印完整报告，所以 stdout 非空就照读。
+- **README 重写**：中英双语，按标准章节（安装/使用/更新/移除/编译/依赖/完成/待做/遗弃/致谢），补了原本缺的移除与更新。标题改 `ANTEX = ANTE + OPENTUI`。
+- **Ante 0.3.2 起子代理有完整落盘**：`sessions/<父>/subagents/<suba_>/events.jsonl` 是整段对话，`ToolEnd.result_json` 也带 `session_id`/`report`/`tool_use_count`/耗时/用量。客户端那套「子代理 = child session」的 UI 仍要等上游推完整事件流，但「跑完看完整过程」已经有数据基础了。
+
 **`2026.11.02rc2`：贴图修好（2.2.5 换了附件形状）**
 
 - **症状**：升级到 2.2.5 后粘贴图片**静默失效**——`files` 回来是空数组、模型说「没看到图片」、垫片日志一行都没有。

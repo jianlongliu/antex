@@ -98,6 +98,7 @@ Per-feature implementation notes and verification steps live in [`docs/implement
 | **Undo / redo** (`/undo`, `/redo`) | Wired to `Op::RewindSession`. Ante really rewrites its own `events.jsonl` and `meta.json` — this is not a UI overlay |
 | **`!` commands** | Run a shell command from the composer; output and exit code land in the transcript. Backed by `Op::ShellInput`, one request per `ShellOutput` |
 | **MCP servers** (`/mcps`) | Configured in `~/.ante/settings.json` (`mcp_servers`), empty until the first prompt, and **cannot be started/stopped from the UI** — Ante has no runtime switch |
+| **Subagent progress** | While an `Agent` call runs, the block shows the last line the subagent said, fed by Ante's live `Evt::ToolUpdate`. The line stays after the call ends — a fast subagent emits it and its result in the same tick |
 | **No fake doors** | Concepts Ante lacks (LSP, VCS, terminals, subagent sessions) are removed from the UI rather than left as dead entries |
 
 ## 功能
@@ -123,6 +124,7 @@ Per-feature implementation notes and verification steps live in [`docs/implement
 | **回溯**（`/undo`、`/redo`） | 接到 Ante 的 `Op::RewindSession`。**Ante 会改写自己的 `events.jsonl` 与 `meta.json`**，不是前端遮一层 |
 | **`!` 命令** | composer 里 `!cmd` 直接跑 shell，输出与退出码进转录，走 `Op::ShellInput`，一个请求换一个 `ShellOutput` |
 | **MCP 服务器**（`/mcps`） | 配在 `~/.ante/settings.json` 的 `mcp_servers`，**第一个提示词之前列表是空的**，面板里**不能启停**——Ante 没有运行时开关 |
+| **子代理进度** | `Agent` 调用跑的时候，块里显示子代理说的最后一句，数据来自 Ante 的 `Evt::ToolUpdate`。**跑完那行也留着**——快子代理在同一 tick 里发完它和结果 |
 | **不装样子** | Ante 没有的概念（LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口 |
 
 ---
@@ -624,7 +626,7 @@ rather than left as dead entries.
 | `/plugins`, `/btw` | No opencode plugin system; `/btw` needs an independent generate op |
 | `/reload`, `/update`, `/restart`, `Ctrl+B` backgrounding | Reloading server config, updating opencode, or backgrounding tool calls mean nothing to Ante |
 | LSP, formatter | No counterpart; entries removed |
-| **Subagent pane / drilling into a subagent** | The client's entire subagent UI hangs off "a subagent is a child session" (`session.parentID` + its own event stream). In Ante a subagent is one `Agent` tool call inside the parent turn, and its internals are never pushed to the frontend. Measured 2026-11-02: `ToolUpdate` appears **zero** times across all recorded sessions, and during `Agent` calls Ante emits only `UsageUpdate`. Rendering the `Agent` call as the client's subagent block is done; drilling in would need upstream to send data it does not send |
+| **Subagent pane / drilling into a subagent** | The client's entire subagent UI hangs off "a subagent is a child session" (`session.parentID` + its own event stream), and Ante does not model one: a subagent is one `Agent` tool call inside the parent turn. What *does* exist since Ante 0.3.2: live `Evt::ToolUpdate` lines (shown under the block now), and a full transcript at `sessions/<parent>/subagents/<suba_>/events.jsonl`. Neither is an event stream the client can subscribe to as a session, so drilling in still needs upstream. |
 
 ## 遗弃
 
@@ -640,7 +642,7 @@ Ante 底层没这个概念，写多少垫片代码也变不出来。这些是从
 | `/plugins`、`/btw` | 无 opencode 插件系统；`/btw` 要的是独立 generate op |
 | `/reload`、`/update`、`/restart`、`Ctrl+B` 后台化 | 重新加载配置 / 更新 opencode / 把工具调用扔后台，对 Ante 都无意义 |
 | LSP、formatter | 无对应概念，入口已摘 |
-| **子代理面板 / 点进子代理** | 客户端的子代理 UI **整套挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流）。Ante 里子代理只是父回合中的一次 `Agent` 工具调用，**内部活动不推给前端**。2026-11-02 实测：全部历史会话 `ToolUpdate` 共 **0 条**，`Agent` 调用期间只发 `UsageUpdate`。按 subagent 块渲染 `Agent` 调用已做；点进去得等上游送它现在不送的数据 |
+| **子代理面板 / 点进子代理** | 客户端的子代理 UI **整套挂在「子代理 = 独立 child session」上**（`session.parentID` + 自己的事件流），而 Ante 不这样建模：子代理只是父回合中的一次 `Agent` 工具调用。Ante 0.3.2 起**有的**：实时 `Evt::ToolUpdate` 行（现在显示在块下面），以及 `sessions/<父>/subagents/<suba_>/events.jsonl` 的完整对话。两者都不是客户端能当会话订阅的事件流，所以「点进去」仍要等上游。 |
 
 ---
 
