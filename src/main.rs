@@ -1470,8 +1470,14 @@ fn event_skipped(name: &str) -> bool {
 /// and falls back to a generic key/value block for anything else. Renaming a
 /// call to the client's spelling is what turns `Agent [description=…]` into the
 /// client's own subagent cell. Tools without a counterpart there — `Edit` (its
-/// cell wants a precomputed patch), `TodoWrite`, `ViewImage` — keep Ante's name
-/// and stay generic rather than degrade into an empty cell.
+/// cell wants a precomputed patch), `ViewImage` — keep Ante's name and stay
+/// generic rather than degrade into an empty cell.
+///
+/// `TodoWrite` → `todowrite` is a plain name match, not a cell: the client's
+/// `sessionTodos()` looks for the exact name to rebuild the current list, so
+/// the unrenamed call left the sidebar's `Todo` block out and the transcript
+/// showing a raw key/value dump. Ante's `todos` already carries the
+/// `content`+`status` shape that `parseTodos()` reads.
 fn client_tool_name(name: &str) -> &str {
     match name {
         "Bash" => "shell",
@@ -1483,6 +1489,7 @@ fn client_tool_name(name: &str) -> &str {
         "WebSearch" => "websearch",
         "Agent" => "subagent",
         "AskUser" => "question",
+        "TodoWrite" => "todowrite",
         other => other,
     }
 }
@@ -2188,6 +2195,13 @@ async fn attach_session(
                 provider: Some(provider),
                 model: Some(model),
                 effort,
+                // Ante 0.3's default set is Bash/Read/Write/Edit/Glob/Grep/
+                // WebFetch/Agent/AskUser — `TodoWrite` is not in it, so a
+                // session started without this never offers the model a todo
+                // list and the client's `Todo` sidebar block has nothing to
+                // read. The tool exists in the binary and accepts the same
+                // `{todos:[…]}` shape the client parses; this just asks for it.
+                include_tools: Some(vec!["TodoWrite".to_string()]),
                 ..Default::default()
             };
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(Op::StartSession(request))).await {
@@ -5876,7 +5890,10 @@ mod tests {
         assert_eq!(client_tool_name("AskUser"), "question");
         // No counterpart on the client side: Ante's own name, generic cell.
         assert_eq!(client_tool_name("Edit"), "Edit");
-        assert_eq!(client_tool_name("TodoWrite"), "TodoWrite");
+        // The client's todo list is built by matching this exact lowercase
+        // name, so the rename is what makes the sidebar block and the
+        // transcript's `# Todos` cell appear at all.
+        assert_eq!(client_tool_name("TodoWrite"), "todowrite");
     }
 
     #[test]
