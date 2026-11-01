@@ -118,7 +118,7 @@ opencode2 --server http://127.0.0.1:41999     # 终端 B
 - **可以多开**：一体化模式下端口被占会**自动往后顺延**（并打印改用哪个），所以第二个、第三个 `antex` 直接跑就行。`serve` 模式相反——按你给的端口，被占就明确报错（换端口会让人连错服务）。
 - 环境变量：`ANTE_BIN` 指定 `ante` 可执行文件（默认 `$PATH`，再退到 `~/.ante/bin/ante`）；`ANTEX_CLIENT` 指定客户端（默认 `~/.local/bin/antex-tui`，再退到 `opencode2` → `opencode`）。**所以不必先 export PATH。**
 - **一体化模式下请求日志写 `/tmp/antex.log`**——写 stdout 会糊在 TUI 上；`serve` 模式仍打在 stdout。
-- **启动自检**：找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**。判据是**系列不是全等**：Ante 自己的版本与它发的 `ante-sdk` 本来就不同步（0.2.14 发的就是 sdk 0.2.14，但 0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也写同一处日志，不留哑谜：`tail /tmp/antex.log`。
+- **启动自检**：找不到 `ante` 就直接报错退出（否则 TUI 能开、消息全石沉大海）；`ante --version` 与二进制里编进去的 `ante-sdk` **不在同一版本系列**（前两段，如 `0.2.x`）才**警告**。判据是**系列不是全等**：Ante 自己的版本与它发的 `ante-sdk` 本来就不同步（0.3.1 配的是 sdk 0.3.0，0.2.14 发的就是 sdk 0.2.14，但 0.2.11 发的是 sdk 0.2.10），比全等会每次启动都误报。运行期连不上、事件流断掉、消息被丢弃也写同一处日志，不留哑谜：`tail /tmp/antex.log`。
 
 **macOS 上多两件事**（其余同上；已在 macOS 27 / arm64 上实测一条命令能起）：
 
@@ -213,7 +213,7 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | serde | 1.0.229 | 派生（features: derive） |
 | serde_json | 1.0.151 | 信封与事件载荷 |
 | futures | 0.3.34 | 流拼接 |
-| ante-sdk | 0.2.14 | 连 Ante（`Op`/`Evt` 协议）；版本跟着 Ante 的 0.2.x 走 |
+| ante-sdk | 0.3.0 | 连 Ante（`Op`/`Evt` 协议）；跟着 Ante 的版本系列走 |
 | reqwest | 0.12.28 | `/connect` 的 OAuth 往返、额度面板取数（rustls） |
 | image | 0.25.10 | 贴图压缩（png/jpeg/gif/webp/bmp/tiff） |
 | base64 | 0.22.1 | 内联 `data:` URL 的收发 |
@@ -227,7 +227,7 @@ Cargo 依赖（`Cargo.lock` 实际解析值，非 `Cargo.toml` 的约束范围�
 | 网络 | 本机现在**直连即可**（代理在路由器上做透明转发）。若哪天又只用本地 mihomo，再 `export http_proxy=https_proxy=http://127.0.0.1:7890`——`script/*.sh` 已改成「只有 7890 真在监听才设代理」 |
 | opencode 客户端 | **2.2.5**，来自本仓库 `vendor/opencode/`（subtree 上游 tag `v2.2.5`），用 `script/build-tui.sh` 自编；官方脚本那份仍装在 `~/.opencode/bin`（`opencode`/`opencode2` 指向它，**2.0.18**，只作兜底） |
 | 跟上游的口子 | `./script/upgrade-upstream.sh [ref]`——默认跟上游**主线**（默认分支 `dev`），也可传 tag（如 `v2.2.5`）。**原先跟的 `v2` 分支 2026-10-10 停更了**（版本停在 2.0.26），别再拿它当上游 |
-| Ante | 接后端时用 **`ante-sdk` 0.2.14**——**已发布 crates.io**，直接写 `ante-sdk = "0.2.14"`（`^0.2.14`，跟着 Ante 的 0.2.x 走）。实测对着 Ante **0.2.14**；启动自检会比对两边的次版本号 |
+| Ante | 接后端时用 **`ante-sdk` 0.3.0**——**已发布 crates.io**，直接写 `ante-sdk = "0.3.0"`（`^0.3.0`）。实测对着 Ante **0.3.1**；启动自检会比对两边的次版本号 |
 
 ## 目录结构
 
@@ -257,7 +257,7 @@ Cargo.toml           axum + tokio + serde
 
 **界面在跑，发消息却没反应？**
 先 `tail /tmp/antex.log`（macOS 上是 `$TMPDIR/antex.log`）：启动自检那行会明说 `ante` 找没找到、版本是不是同一系列（例如
-`自检：… → ante 0.2.14；antex 编译于 ante-sdk 0.2.14，同一版本系列`）。自检过了还没反应，就看日志里
+`自检：… → ante 0.3.1；antex 编译于 ante-sdk 0.3.0，同一版本系列`）。自检过了还没反应，就看日志里
 「未连接 / 事件流结束 / 消息被丢弃」那几句——它不会静默。
 
 **启动后模型列表要等几秒才出来？**

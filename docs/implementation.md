@@ -47,7 +47,12 @@
 - [x] **会话内 `/cd`：明确报错而非静默** —— Ante 的目录在 `StartSession` 时由 `SessionRequest.cwd` 定死，`SessionUpdate` 里没有目录字段，`~/Projects/ante` 全仓也没有换目录的 op。原先这条路由落通用 fallback（200 + 空 data），客户端把它显示成 `UnexpectedStatus: 200`（`POST /api/session/{id}/move` 的 schema 要 204）；现在回 **400 + 人话**（「Ante 的会话目录在建会话时就定死了…要换目录请开一条新会话」），TUI 放进 toast。**没做「按新目录重开会话」的退化**：历史留在旧会话、列表里多一条，代价比收益大（只在 README 待定里留着）
 - [x] **次要事件** —— `session.step.streamed`（每个 step 一次，`ensure_streamed!`）、`session.renamed`（新会话首条消息定标题；`/rename` 与 Ante 自己报来的改名也发这条）、`session.model.selected`（切模型，带 `previous`，读旧值在覆写之前）。`instructions.updated` 不适用（Ante 无此概念）
 
-- [x] **命令行参数** —— `[PORT]` / `--port PORT` / `-h|--help`；不认识的参数打印用法并以 2 退出；**端口被占给明确提示、不再 panic**
+- [x] **待办（`▼ Todo`）** —— 2026-11-02 补上，两处缺一不可：
+  - **`StartSession.include_tools` 要 `TodoWrite`**。Ante 0.3 的默认工具集是 Bash/Read/Write/Edit/Glob/Grep/WebFetch/Agent/AskUser，**没有 TodoWrite**——不显式要的话模型会直接回「我没有这个工具」（`ante serve --stdio` 直连、`include_tools:["TodoWrite"]` 后同一条提示词就能 `ToolStart{tool_name:"TodoWrite"}`，已实测）。而 **`SessionUpdate` 与 `ResumeSession` 都不带工具集参数**，所以只有新建会话这条路能带上：**升级前就开着的旧会话要重开才有待办**。
+  - **工具名要转成 `todowrite`**。客户端不调接口取待办：`util/todo.ts` 的 `sessionTodos()` 从消息里找**最后一次** `todowrite` 调用、解析 `state.input.todos`，而且是**精确字符串匹配**（`item.name === "todowrite"`）。垫片原先保留 Ante 原名，于是侧栏整块不画、转录里那次调用只画成通用 key/value 块。Ante 的 `todos` 字段本来就是 `{content, status}` 形状，`parseTodos()` 直接吃得下（多出来的 `activeForm` 被忽略）。
+  - **只显示最后一次**：Ante 的 `TodoWrite` 是全量覆盖语义，与客户端「取最新一条」的假设一致，不会丢状态。
+  - **验证法**：`tui_drive.py --cmd "~/.local/bin/antex PORT" --send '6:用 TodoWrite 建一个三步计划，只完成第一步\r'`，侧栏应出 `▼ Todo` 带 `[•]` 进行中 / `[ ]` 待办；`cargo test tools_the_client_draws_get_its_name` 钉住改名。
+
 - [x] **`/compact` 压缩** —— `POST …/compact` → Ante 的 **`Op::Compact`**（真压缩，不是假动作）。**Ante 不用 `CompactStart/CompactEnd` 报进度**（那只在真做了缩减时才发），日常走 **`InfoBlockStart`/`InfoBlockAppend`（id 以 `compact` 开头）** → 映射成 `compaction.started/delta/ended`；另补 **inbox 握手**（`enqueued`+`delivered`），否则客户端把队列项一直挂在底部不落正文。实测：Ante 回「Context is already within budget; nothing to compact.」，UI 出 `Compaction` 块
 - [x] **客户端实际调用的接口全覆盖** —— 对照一次完整使用过程收集到的 **32 条请求**，补齐了原先漏掉的 9 个：`/api/form`、`/api/shell`（GET+POST）、`/api/reference`、`/api/integration`、`/api/project`（**裸数组**，同 `/api/config`）、`/api/mcp/resource`（`{resources,templates}`）、`/api/vcs/base`（`data: null`）、`/api/vcs/diff`、`/api/experimental/session/{id}/terminal`（`{data}`）。Ante 没有这些数据，**但形状严格照 schema**——原先落到通用 fallback，它多带一个 `info` 字段，恰好违反这些路由的 `additionalProperties:false`，客户端会把整个响应校验掉、面板**静默为空**
 - [x] **Herdr 上报** —— 跑在 herdr pane 里时由**垫片自己**上报 pane 状态（`idle`/`working`/`blocked`）与 Ante 会话 id，压过 herdr 内置的「把客户端认成 opencode」的检测。见 [pitfalls.md](pitfalls.md) 的「Herdr 集成」
@@ -126,6 +131,8 @@
 **不在这张表里了**：遗弃项不用验（Ante 没有这个概念），待定项不用验（没做就是没做）。判断某个入口该不该留在界面上，看 [README](../README.md) 的「状态」清单，再用 [client-patches.md](client-patches.md) 的验收法复核一次即可。
 
 **待定现在只剩三条，都在 README 的「待定与遗弃」里**：真多标签（要先证 Ante 能并发驱动多会话）、`/fork`（op 齐了、界面还没接）、会话内 `/cd` 的退化方案（`/cd` 本身已经会明确报错）。
+
+**待办（Todo）2026-11-02 从「没做」转正**，见上面实现清单那条——它原先被误判成只差改名，实际还要在 `StartSession` 里要工具。
 
 ## 审批
 
@@ -229,6 +236,17 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **两个新编译期常量**（`build.rs`）：`ANTEX_PKG_VERSION` 读 `PKGBUILD` 的 `pkgver`（与 `pacman -Q` 和 tag 对得上）、`ANTEX_CLIENT_VERSION` 读 `vendor/opencode/package.json`。构建日期 `ANTEX_VERSION` 保持独立——**本地 `cargo build` 只动它，别拿它判断包版本**。
 - **`--help` 全英文**，并写明客户端子命令归客户端（`serve` / `service` / `upgrade` / `uninstall` 走的是官方 opencode，不是垫片）。错误参数 = 一行 `error: …` + 整份 help + `exit 2`，都走 stderr。
 - **`antex-tui --version` 的假串也治了**：根因在上游 `packages/script/src/index.ts`——没给 `OPENCODE_VERSION`、channel 又不是 `latest` 时它自己拼 `0.0.0-<channel>-<时间戳>`。`script/build-tui.sh` 现在把 vendor 的版本喂进去，**在下次重建客户端时生效**；本版没重建，所以包里的 `antex-tui --version` 仍是旧串，`antex --version` 已经绕开它。
+
+**`2026.11.02rc1`：上游 opencode 2.0.29 → 2.2.5（opentui 0.5.17 → 0.8.0），待办面板转正**
+
+- **跨了 1381 个提交**，11 处客户端补丁全部存活，只有 4 个文件冲突（`builtins.ts`、`dialog-model.tsx`、`client/solid/data.ts`、`cli/package.json`）。冲突的共同形态是「上游在同几行加了新能力」，解法一律是取上游新字段、只留我们那句判断；详细逐条见 [client-patches.md](client-patches.md) 那份「2026-11-02 实测结论」。
+- **两个随升级暴露的真问题**（都不报错、只在界面上炸）：
+  - `GET /api/experimental/usage/limits` 客户端当 `UsageLimitsInfo | null` 读，通用 fallback 答 `data: []`，模型选择器**直接崩**在 `t.budgets.flatMap`。加显式路由答 `null`（客户端自己的「没登录 Console」）。
+  - 构建产物目录名改成 `cli-<os>-<arch>`，`script/build-tui.sh` 里写死的 `cli-linux-x64` 让软链指向不存在的路径，`antex` 一启动就 `No such file or directory`。
+  - 另：`~/.local/bin` 里的二进制被 macOS 判 `com.apple.provenance` 后会 SIGKILL（rc=137），要用 `install` + `xattr -c`，别直接 `cp`。
+- **待办（`▼ Todo`）转正**：`StartSession.include_tools` 要 `TodoWrite` + 工具名转 `todowrite`，两块缺一不可，见上面实现清单那条。
+- **`script/tui_drive.py` 收尾卡死**：客户端一直往 pty 写，子进程卡在写里就收不掉，SIGKILL 之后 `waitpid` 也永久阻塞（探针表现为「毫无输出地挂住」）。改成先 SIGTERM + WNOHANG 轮询，不吐就排空并关掉 pty 再收尸。
+- **`cli.json` 那几层**：客户端的配置对话框会**整份重写**这份文件，`plugins`/`keybinds`/`tabs` 不在内存里就跟着没。垫片会自动注入兜底（2026-11-02 专门验过：把这三层全删掉再进 TUI，`/btw`、`/diff`、`/plugins` 仍然是摘掉的）——**但手动连的客户端收不到注入**，那种情况要自己在文件里写全。
 
 **`2026.10.22.1`（已出）：补发 2026.10.22 的包（CI 修好了）**
 

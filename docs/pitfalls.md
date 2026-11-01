@@ -82,6 +82,6 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 
 | 内容 | 位置 |
 | --- | --- |
-| HTTP 规格（136 端点） | opencode 仓库 `v2` 分支 `packages/protocol/openapi.json` |
-| 事件定义 | 同分支 `packages/schema/src/event.ts`、`session-event.ts` |
+| HTTP 规格（2.2.5 实为 **138** 端点） | 上游 tag `v2.2.5` 的 `packages/protocol/openapi.json`；**别再读 `v2` 分支**（2026-10-10 停更，版本停在 2.0.26） |
+| 事件定义 | 同 tag 的 `packages/schema/src/event.ts`、`session-event.ts`；或本地 `vendor/opencode/` 里的同一份（subtree 就是上游源码） |
 | 真 server 形状对照 | 起一个真 server 当 oracle：`opencode2 serve --hostname 127.0.0.1 --port 41998`（日志打印 `server password <PW>`；API 用 HTTP Basic，用户名 `opencode`），再订阅 `/api/event` 抓权威事件序列 |
