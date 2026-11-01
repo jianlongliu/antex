@@ -383,37 +383,74 @@ async fn commandcode_month_window(key: &str, remaining: f64) -> Option<(f64, Opt
     Some(((used / allowance * 100.0).clamp(0.0, 100.0), reset))
 }
 
+/// ChatGPT / Codex subscription limits, asked of Ante rather than fetched by us.
+///
+/// Ante 0.3.2 grew `ante usage --json`, which reports the same windows this used
+/// to read out of `chatgpt.com/backend-api/wham/usage` — and it owns the token
+/// refresh, the account-id header, and labelled sign-ins (`openai/work`). Keeping
+/// a second implementation here meant re-deriving all of that and drifting from
+/// Ante's own answer, so this delegates instead.
+///
+/// Output shape (0.3.2):
+///
+/// ```json
+/// {"subscriptions":[{"credential":"openai","provider":"openai",
+///   "email":"…","plan":"Plus","status":"ready",
+///   "windows":[{"label":"Current session","used_percent":1,
+///               "resets_at":"2026-11-01T20:25:26Z"}, …]}]}
+/// ```
+///
+/// The shim is a single long-running process while this is a child process, so
+/// it is spawned per fetch and covered by the same cache as every other
+/// provider (5 minutes on success) — a few tens of milliseconds, amortised.
 async fn chatgpt() -> Result<Quota, String> {
-    let credential = openai_credential().await?;
-    let account = account_id(&credential.access);
-    let mut headers: Vec<(&str, &str)> = Vec::new();
-    if let Some(account) = account.as_deref() {
-        headers.push(("ChatGPT-Account-Id", account));
+    let bin = crate::ante_executable().ok_or_else(|| "ante not found".to_string())?;
+    let out = tokio::process::Command::new(bin)
+        .arg("usage")
+        .arg("--json")
+        .output()
+        .await
+        .map_err(|err| format!("ante usage: {err}"))?;
+    if !out.status.success() {
+        // Ante exits 1 when a selected sign-in is expired or unavailable, and
+        // still prints the full report — so read stdout either way.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.stdout.is_empty() {
+            return Err(format!("ante usage failed: {}", stderr.trim()));
+        }
     }
-    let body = get_json("https://chatgpt.com/backend-api/wham/usage", &credential.access, &headers).await?;
+    let body: Value = serde_json::from_slice(&out.stdout).map_err(|err| format!("ante usage json: {err}"))?;
+    let Some(account) = body
+        .get("subscriptions")
+        .and_then(Value::as_array)
+        .and_then(|list| list.iter().find(|item| item.get("provider").and_then(Value::as_str) == Some("openai")))
+    else {
+        return Err("not signed in (/connect)".to_string());
+    };
+    // `expired` / `unavailable` mean the subscription cannot be asked, which is
+    // the same thing as not having one — the panel hides the row either way.
+    if let Some(status) = account.get("status").and_then(Value::as_str)
+        && status != "ready"
+    {
+        return Err(format!("openai subscription {status}"));
+    }
     let mut rows = Vec::new();
-    let rate_limit = body.get("rate_limit").and_then(Value::as_object);
-    for (field, fallback) in [("primary_window", "5h"), ("secondary_window", "W")] {
-        let Some(window) = rate_limit.and_then(|limit| limit.get(field)) else {
-            continue;
-        };
+    for window in account.get("windows").and_then(Value::as_array).into_iter().flatten() {
         let Some(used) = window.get("used_percent").and_then(Value::as_f64) else {
             continue;
         };
-        let label = match window.get("limit_window_seconds").and_then(Value::as_i64) {
-            Some(604_800) => "W",
-            Some(2_628_000) => "M",
-            Some(18_000) => "5h",
-            _ => fallback,
-        };
+        let label = window.get("label").and_then(Value::as_str).unwrap_or("");
         rows.push(Row::Window {
-            label: label.to_string(),
+            label: short_window_label(label),
             used_percent: used.clamp(0.0, 100.0),
-            reset_ms: window.get("reset_at").and_then(Value::as_i64).map(|at| at * 1000),
+            reset_ms: window
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_ms),
         });
     }
     if rows.is_empty() {
-        return Err("no usage windows (this account may not share ChatGPT usage)".to_string());
+        return Err("no usage windows".to_string());
     }
     Ok(Quota {
         rows,
@@ -421,40 +458,31 @@ async fn chatgpt() -> Result<Quota, String> {
     })
 }
 
-struct OpenAiCredential {
-    access: String,
-}
-
-/// Read a still-valid token for the account Ante itself would pick, using the
-/// same resolution as the model picker ([`crate::integrations::resolve_held`]):
-/// an exact `openai` credential wins, else the lexicographically first labelled
-/// one. Refreshing stays Ante's job so a quota request cannot consume a
-/// rotating refresh token behind its back.
-async fn openai_credential() -> Result<OpenAiCredential, String> {
-    let home = crate::ante_home();
-    let path = openai_credential_path(&home).ok_or_else(|| "not signed in (/connect)".to_string())?;
-    let text = std::fs::read_to_string(path).map_err(|_| "not signed in (/connect)".to_string())?;
-    let stored: Value = serde_json::from_str(&text).map_err(|_| "cannot read OAuth credential".to_string())?;
-    let expires = stored.get("expires_at").and_then(Value::as_str)
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .ok_or("OAuth credential has no valid expiry")?;
-    if expires.timestamp_millis() <= now_ms() {
-        return Err("OAuth token expired; use Ante to refresh it".to_string());
+/// The panel has 36 columns; Ante's labels ("Current session", "Weekly limit")
+/// are too wide. Their meaning maps onto the same shorthand the other providers
+/// already use, and an unrecognised label falls back to a truncated form.
+fn short_window_label(label: &str) -> String {
+    let lower = label.to_lowercase();
+    if lower.contains("session") || lower.contains("5h") {
+        return "5h".to_string();
     }
-    let access = stored.get("access_token").and_then(Value::as_str)
-        .filter(|s| !s.is_empty()).ok_or("OAuth credential has no access token")?;
-    Ok(OpenAiCredential { access: access.to_string() })
+    if lower.contains("week") {
+        return "W".to_string();
+    }
+    if lower.contains("month") {
+        return "M".to_string();
+    }
+    if lower.contains("day") {
+        return "D".to_string();
+    }
+    label.chars().take(6).collect()
 }
 
-/// OAuth profiles stored under `auth/credentials/oauth/`, labelled ones
-/// included as `openai/work` so they read the same as `ante auth list`.
-/// Which stored sign-in the ChatGPT quota belongs to: the same account
-/// resolution the model picker uses, so the panel cannot report one account's
-/// usage while the picker runs on another.
-fn openai_credential_path(home: &std::path::Path) -> Option<std::path::PathBuf> {
-    let held = stored_oauth_names(home);
-    let name = crate::integrations::resolve_held("openai", held.iter().map(String::as_str))?;
-    Some(home.join("auth/credentials/oauth").join(format!("{name}.json")))
+/// `2026-11-01T20:25:26Z` → epoch milliseconds, for the countdown column.
+fn parse_rfc3339_ms(text: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|at| at.timestamp_millis())
 }
 
 fn stored_oauth_names(home: &std::path::Path) -> Vec<String> {
@@ -476,18 +504,6 @@ fn stored_oauth_names(home: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     walk(&root, &root, &mut out);
     out
-}
-
-/// access token 里的 `chatgpt_account_id`（与 Ante 读的是同一个声明）。
-fn account_id(access: &str) -> Option<String> {
-    let payload = access.split('.').nth(1)?;
-    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: Value = serde_json::from_slice(&decoded).ok()?;
-    claims
-        .get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_account_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 async fn opencode(keys: &[&str]) -> Result<Quota, String> {
@@ -898,22 +914,6 @@ fn rfc3339_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_quota_panel_reads_the_account_the_picker_uses() {
-        let dir = std::env::temp_dir().join(format!("antex-quota-{}", std::process::id()));
-        let oauth = dir.join("auth/credentials/oauth");
-        std::fs::create_dir_all(oauth.join("openai")).unwrap();
-        for name in ["openai/work", "openai/home"] {
-            std::fs::write(oauth.join(format!("{name}.json")), "{}").unwrap();
-        }
-        // Unlabelled reference: lexicographically first label, as Ante does.
-        assert!(openai_credential_path(&dir).unwrap().ends_with("openai/home.json"));
-        std::fs::write(oauth.join("openai.json"), "{}").unwrap();
-        // An exact credential wins over any labelled one.
-        assert!(openai_credential_path(&dir).unwrap().ends_with("openai.json"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn unlabelled_secret_resolves_the_account_ante_picks() {
