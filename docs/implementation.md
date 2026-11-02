@@ -55,7 +55,7 @@
 
 - [x] **`/compact` 压缩** —— `POST …/compact` → Ante 的 **`Op::Compact`**（真压缩，不是假动作）。**Ante 不用 `CompactStart/CompactEnd` 报进度**（那只在真做了缩减时才发），日常走 **`InfoBlockStart`/`InfoBlockAppend`（id 以 `compact` 开头）** → 映射成 `compaction.started/delta/ended`；另补 **inbox 握手**（`enqueued`+`delivered`），否则客户端把队列项一直挂在底部不落正文。实测：Ante 回「Context is already within budget; nothing to compact.」，UI 出 `Compaction` 块
 - [x] **客户端实际调用的接口全覆盖** —— 对照一次完整使用过程收集到的 **32 条请求**，补齐了原先漏掉的 9 个：`/api/form`、`/api/shell`（GET+POST）、`/api/reference`、`/api/integration`、`/api/project`（**裸数组**，同 `/api/config`）、`/api/mcp/resource`（`{resources,templates}`）、`/api/vcs/base`（`data: null`）、`/api/vcs/diff`、`/api/experimental/session/{id}/terminal`（`{data}`）。Ante 没有这些数据，**但形状严格照 schema**——原先落到通用 fallback，它多带一个 `info` 字段，恰好违反这些路由的 `additionalProperties:false`，客户端会把整个响应校验掉、面板**静默为空**
-- [x] **Herdr 上报** —— 跑在 herdr pane 里时由**垫片自己**上报 pane 状态（`idle`/`working`/`blocked`）与 Ante 会话 id，压过 herdr 内置的「把客户端认成 opencode」的检测。见 [pitfalls.md](pitfalls.md) 的「Herdr 集成」
+- [x] **Herdr 上报** —— 跑在 herdr pane 里时由**垫片自己**把 pane 状态（`idle`/`working`/`blocked`）与 Ante 会话 id 写成 **OSC 7501**（herdr-core 唯一的通道；老 `herdr pane report-agent` 在 herdr-app 的 `wZ:p1` pane id 下全部静默失败），压过 herdr 内置的「把客户端认成 opencode」的检测。见 [pitfalls.md](pitfalls.md) 的「Herdr 集成」
 - [x] **贴图（图片附件）** —— 客户端把粘贴的图作为 `data:` URL 放进 prompt body 的 `files`，而 **Ante 协议里没有图像字段**（`Op::UserInput(String)`，只有文本）。垫片走 Ante 自己认的那条路：**把图落盘到 Ante 的 paste 缓存（`$TMPDIR/ante-paste-cache/`）并在文本末尾追加 `@路径`**——Ante 的 TUI 和它的 ACP 前端都是这么送图的。细节与坑：
   - **必须压**：Ante 对超过约 240KB base64（≈170KB 原文件）的图是**丢弃**（给模型一句「图太大」），不缩放；实测 2400×1600/118KB 能读、2000×1400/15.5MB 读不到。垫片自带阶梯压缩（`src/attachments.rs`，`image` crate：长边压到 ≤1568，PNG 源优先 PNG、照片走 JPEG 质量阶梯），目标 ≤160KB，达标即停。
   - **回显**：客户端自己不带图（源码注释写明 file 内容由 server 加载），所以垫片把压好的图塞回 `files`（`{data, mime, source:{type:"inline"}, name}`）——`payload.files` 给 inbox、message 对象的 `files` 给转录区。**没开 TUI 的图片预览开关时，转录区只显示一个 ` file <名字> ` 标签**。
@@ -236,6 +236,14 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **两个新编译期常量**（`build.rs`）：`ANTEX_PKG_VERSION` 读 `PKGBUILD` 的 `pkgver`（与 `pacman -Q` 和 tag 对得上）、`ANTEX_CLIENT_VERSION` 读 `vendor/opencode/package.json`。构建日期 `ANTEX_VERSION` 保持独立——**本地 `cargo build` 只动它，别拿它判断包版本**。
 - **`--help` 全英文**，并写明客户端子命令归客户端（`serve` / `service` / `upgrade` / `uninstall` 走的是官方 opencode，不是垫片）。错误参数 = 一行 `error: …` + 整份 help + `exit 2`，都走 stderr。
 - **`antex-tui --version` 的假串也治了**：根因在上游 `packages/script/src/index.ts`——没给 `OPENCODE_VERSION`、channel 又不是 `latest` 时它自己拼 `0.0.0-<channel>-<时间戳>`。`script/build-tui.sh` 现在把 vendor 的版本喂进去，**在下次重建客户端时生效**；本版没重建，所以包里的 `antex-tui --version` 仍是旧串，`antex --version` 已经绕开它。
+
+**`2026.11.02`（已出）：正式版，Herdr 改走 OSC 7501 转正**
+
+- **Herdr 上报整条重写**：原先 fork `herdr pane report-agent` 子进程（`--source`/`--agent`/`--seq`，3 秒超时、输出全丢），现在只往自己的 tty 写 `ESC ] 7501 ; app=Ante:state=<状态> BEL`。**旧路在 herdr-app 下全是静默失败**：它给的 `HERDR_PANE_ID` 形如 `w12:p1`，属它自己 core 的命名空间，独立 `herdr` 二进制不认，实测报 `pane … not found`。新路不依赖 pane id，也不起子进程，写 `/dev/tty` 而非 stdout（TUI 占着 stdout，写进去会糊屏）。
+- **门控跟着简化**：只看 `HERDR_ENV=1`（原先还要 `HERDR_PANE_ID` + `HERDR_BIN_PATH`）；`--seq` 那条"只增不减"的约束一起消失——7501 没有序号语义，后到覆盖先到。
+- **字段值要洗控制字符**：带换行的上报会被终端整条丢掉，丢掉的是状态本身，所以消息里的控制字符拍成空格再发。
+- **真机验收**（2026-11-02，herdr-core）：`hc run --bg antex` → `hc get <t>` 的 `status` 是 `{"app":"Ante","state":"idle"}`；发一条提示词变 `working`，回合结束回 `idle`（`turn` 从 0 涨到 1）。旧版垫片跑的 pane 仍显示 `opencode`，换新二进制重开即变 `Ante`。
+- 本次与上游合并：本地快进到 `2d0372e1`（opencode 2.0.29 → 2.2.5 等 15 个提交），无冲突；`cargo test` 69/69。
 
 **`2026.11.02rc3`：子代理能看见在说什么；额度面板交给 Ante；README 重写**
 

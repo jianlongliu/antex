@@ -60,23 +60,25 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | 手写的 `auth/<preset>.json` 一会儿就被 Ante 删了 | Ante 用它**预设里写死的** issuer 续签（文件里的 `token_issuer` 不参与，实测 `/tmp` 里塞假 issuer 也没人搭理），401 即 `deleting <preset> oauth credential: refresh token rejected by issuer`。**这也意味着：写进去的必须是真令牌**，编不出来 |
 | 想看清 Ante 自己怎么写凭证 | 驱动它的登录即可，不必真账号：`ANTIX_API_URL=http://127.0.0.1:<假服务器>` + `ante auth login antix --no-browser --callback-port <口>`，授权 URL、令牌请求体、落盘文件名都看得见（2026-10-14 就是这么定下 `auth/<preset>.json` 那八个字段的） |
 
-## Herdr 集成（本机 herdr 0.9.1）
+## Herdr 集成（OSC 7501）
 
-本机在 **herdr**（terminal workspace manager）里跑 antex。herdr 自带 opencode 识别，但那条路看到的是**客户端**（把 pane 报成 `opencode`），状态靠屏幕内容猜；垫片自己上报更准，也是 Herdr 官方给 agent 作者的路子——<https://herdr.dev/docs/add-herdr-support>，不用等上游发包。
+本机在 **herdr** 里跑 antex。herdr 自带 opencode 识别，但那条路看到的是**客户端**（把 pane 报成 `opencode`），状态靠屏幕内容猜；垫片自己上报更准。
+
+**上报方式＝直接往自己的 tty 写 OSC 7501**，`ESC ] 7501 ; app=Ante:state=<状态> BEL`。这是 herdr-core 唯一读的通道（`hc get <t>` 的 `status`、`herdr-app` 侧栏的状态点都来自它）。**不要再走 `herdr pane report-agent`**：herdr-app 给的 `HERDR_PANE_ID` 形如 `wZ:p1`，是它自己 core 的命名空间，独立 `herdr` 二进制不认，实测返回 `pane wZ:p1 not found`，上报全部静默丢失（2026-10-31 定案）。
 
 | 项 | 做法 |
 | --- | --- |
-| 门控 | 仅当 `HERDR_ENV=1` 且 `HERDR_PANE_ID`／`HERDR_BIN_PATH` 都在；不在 herdr 里跑则全程无操作 |
-| 上报 | `--source antex`、`--agent Ante`（用户看到的名字；客户端只是个皮） |
-| 状态映射 | Ante 连上 → `idle`；`Evt::TurnStart` → `working`；`Evt::TurnEnd` → `idle`；`TurnPause{Approval}` → `blocked`（`--message` 写「等待批准：工具名」） |
-| 会话 | 切到别的会话时补一条 `idle`，带 `--agent-session-id <Ante 会话 id>`；herdr 对「跑完一轮的 idle」显示为 `done`（它自己的完成态） |
-| `--seq` | 毫秒时间戳，且只增不减（同毫秒也严格递增）——否则 herdr 丢这条上报 |
-| 子进程 | stdout/stderr 全丢、3 秒超时、失败静默：TUI 占着终端，child 往里写会糊屏 |
-| 退出 | 默认模式下退出前发 `pane release-agent`；`serve` 模式被 Ctrl+C 杀时靠 herdr 兜底（pane 回到 shell 即清空） |
+| 门控 | 仅当 `HERDR_ENV=1`；不在 herdr 里跑则全程无操作 |
+| 上报 | `app=Ante`（用户看到的名字；客户端只是个皮），写 `/dev/tty` 而不是 stdout——TUI 占着 stdout |
+| 状态映射 | Ante 连上 → `idle`；`Evt::TurnStart` → `working`；`Evt::TurnEnd` → `idle`；`TurnPause{Approval}` → `blocked` 并带 `kind=permission` 与说明 |
+| 会话 | 切到别的会话时补一条 `idle`，带 Ante 会话 id |
+| 清洗 | 字段值里的控制字符拍成空格：带换行的上报会被终端整条丢掉，丢掉的是状态本身 |
+| 退出 | 退出前发一条 `state=idle`；被 Ctrl+C 杀时靠 herdr 兜底（pane 回到 shell 即清空） |
+| 顺序 | 无需序号：7501 没有 `--seq`，后到覆盖先到 |
 
-**两个本版限制**（不是没写，是上游没有）：`report-agent -- <resume命令>` 要 herdr **0.10.0**（本机 0.9.1 里连这个参数都没有），且 antex 也没有「按会话 id 直接开」的入口，故不报 resume；`--message` 在 0.9.1 的 `pane get` 里不落地（发了不报错，留着待上游）。
+**字段实测**（2026-10-31，本机 herdr-core）：`state`（唯一必填）、`app`、`kind`、`progress` 都落地；`msg` 被接受但 `hc get` 的 `status` 里不出现，看不出是否渲染，留着不碍事。
 
-**验收（不必进 TUI）**：`herdr tab create` 造个测试 tab → `herdr pane run <pane> "antex serve 41999"` → `herdr agent list` 出现 `Ante / idle`；发一条 prompt 变 `working`、跑完变 `done`；`SHIM_PERMISSION_MODE=strict` 下拦到危险命令变 `blocked`。测完 `herdr tab close <tab>`。**旧版垫片跑的 pane 仍显示 `opencode`**（那是 herdr 内置检测），换新二进制重开即变 `Ante`。
+**验收**：`hc run --bg <antex>` → `hc get <t>` 的 `status` 应是 `{"app":"Ante","state":"idle"}`；发一轮 prompt 变 `working`，跑完回 `idle`；拦到危险命令变 `blocked` + `kind=permission`。
 
 ## 权威出处
 
