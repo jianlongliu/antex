@@ -51,6 +51,20 @@ jobs:
           git tag "${{ steps.ver.outputs.tag }}" 2>/dev/null || true
           git push origin "${{ steps.ver.outputs.tag }}"
 
+      # runner 的根盘只有 ~14GB，而这一步要装 base-devel + rust + bun，
+      # 再用 bun 拉 1797 个包（含所有平台的二进制，共约 10GB）。2026-11-04
+      # 那次就是这么挂的：`ENOSPC`，日志末尾写着 "Free space left: 3 MB"。
+      # 镜像里预装的工具链（Android SDK / .NET / Haskell 等）这一步一个都用不到，
+      # 先删掉腾出空间再编。
+      - name: 腾磁盘（镜像预装的工具链用不到）
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift /usr/local/.ghcup || true
+          sudo docker image prune -af --filter "until=1h" || true
+          df -h /
+
       - name: 在 Arch 容器里 makepkg
         run: |
           mkdir -p build
