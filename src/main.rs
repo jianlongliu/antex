@@ -354,6 +354,15 @@ struct Ante {
     /// A turn is running. Decides between handing text to Ante as a queued input
     /// and steering it into the turn already in flight.
     busy: Arc<std::sync::atomic::AtomicBool>,
+    /// What each session is running, per session, keyed by the client's id.
+    ///
+    /// `model`/`effort` above are process-wide — they answer "what did the client
+    /// last commit anywhere", which is what `attach_session` needs for a brand-new
+    /// session. That is a different question from "what is *this* session running",
+    /// and only the second one can tell a genuine switch from the re-commit the
+    /// client sends with every prompt. Restored sessions never pass through
+    /// `store.sessions`, so they need a record of their own.
+    running: Arc<Mutex<HashMap<String, RunningModel>>>,
     /// The archive name Ante gave each session, keyed by the id the *client*
     /// used. Ante mints its own id at `StartSession` and never reports it in
     /// response, so `Evt::SessionStart` is the only place the pair shows up —
@@ -471,6 +480,7 @@ impl Ante {
             effort: Arc::new(Mutex::new(None)),
             last_user: Arc::new(Mutex::new(String::new())),
             busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running: Arc::new(Mutex::new(HashMap::new())),
             archives: Arc::new(Mutex::new(HashMap::new())),
             skills: Arc::new(Mutex::new(Vec::new())),
             mcp: Arc::new(Mutex::new(Vec::new())),
@@ -809,6 +819,28 @@ enum Replay {
     /// is not a replay, and whatever was handed to that connection is still
     /// owed to the user.
     Unresumed,
+}
+
+/// What one session is running.
+///
+/// The effort level used to be a single string, which conflated two different
+/// things and made the no-op guard fire on every prompt:
+///
+/// * `wanted` is what the client asked for — it re-sends this same value with
+///   every prompt, so this is what a repeat has to be compared against.
+/// * `resolved` is what Ante actually settled on. A provider that cannot honour
+///   a level rounds it *down* (`max` → `xhigh`), and that rounded value is what
+///   the session list, `GET /session/{id}` and the TUI's variant picker must
+///   show.
+///
+/// Keeping them apart is what lets `max` be both "already applied, ignore the
+/// re-commit" and "showing as xhigh, because that is what runs".
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct RunningModel {
+    provider: String,
+    model: String,
+    wanted: String,
+    resolved: String,
 }
 
 #[derive(Clone)]
@@ -1196,6 +1228,66 @@ impl Store {
             .ok()
             .and_then(|slot| slot.clone())
             .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// What *this* session is recorded as running, as
+    /// `(provider, model, variant)`.
+    ///
+    /// The client re-sends its model on every submit (opencode's `commitModel`
+    /// rides along with each prompt), so most switches name what the session
+    /// already has. Only a per-session record can answer that — the slots above
+    /// are the last commit of *any* session, which is a different question.
+    fn recorded_model(&self, session_id: &str) -> Option<RunningModel> {
+        if let Ok(running) = self.ante.running.lock()
+            && let Some(entry) = running.get(session_id)
+        {
+            return Some(entry.clone());
+        }
+        // A session this process has not switched yet still has a record if it was
+        // created here; restored sessions have neither, and answer `None`. Nothing
+        // has resolved yet, so both levels start as what was asked for.
+        let sessions = self.sessions.lock().ok()?;
+        let model = sessions.iter().find(|session| session["id"] == session_id)?.get("model")?;
+        let wanted = model.get("variant").and_then(Value::as_str).unwrap_or("default").to_string();
+        Some(RunningModel {
+            provider: model.get("providerID").and_then(Value::as_str)?.to_string(),
+            model: model.get("id").and_then(Value::as_str)?.to_string(),
+            resolved: wanted.clone(),
+            wanted,
+        })
+    }
+
+    /// Remember what a session asked for and what it settled on, so the client's
+    /// per-prompt re-commit of the same request is recognized as a no-op.
+    fn remember_model(&self, session_id: &str, provider: &str, model: &str, wanted: &str, resolved: &str) {
+        if let Ok(mut running) = self.ante.running.lock() {
+            running.insert(
+                session_id.to_string(),
+                RunningModel {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    wanted: wanted.to_string(),
+                    resolved: resolved.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Ante settled on a level for a session already on record: keep the request
+    /// as it was and move only what is shown. This is the rounding case, where
+    /// `max` was asked for and `xhigh` is what runs.
+    fn resolve_effort(&self, session_id: &str, provider: &str, model: &str, effort: &str) {
+        if let Ok(mut running) = self.ante.running.lock() {
+            let entry = running.entry(session_id.to_string()).or_insert_with(|| RunningModel {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                wanted: effort.to_string(),
+                resolved: effort.to_string(),
+            });
+            entry.provider = provider.to_string();
+            entry.model = model.to_string();
+            entry.resolved = effort.to_string();
+        }
     }
 }
 
@@ -2544,6 +2636,21 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                         log_line(&format!("ante: 会话 {client} 的存档是 {archive}"));
                         store.ante.remember_archive(&client, archive.clone());
                     }
+                    // What the session actually runs, effort included. A restored
+                    // conversation never passed through the create route, so this
+                    // is the only place its model becomes known — and without it
+                    // the client's per-prompt re-commit of the same request would
+                    // look like a switch. Both levels start equal: nothing has
+                    // rounded anything yet.
+                    let effort =
+                        info.model.effort.map(|effort| effort.as_str()).unwrap_or("default");
+                    store.remember_model(
+                        &client,
+                        info.provider.id.as_str(),
+                        &info.model.id,
+                        effort,
+                        effort,
+                    );
                     // A title Ante already has — one set from its own front end, or
                     // by a rename this shim asked for — is what the picker should
                     // read back, so keep the shim's copy in step with it.
@@ -2579,6 +2686,19 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                         && let Some(model) = entry.get_mut("model")
                     {
                         model["variant"] = json!(effort);
+                    }
+                    // The per-session record keeps the *request* untouched and moves
+                    // only what is shown. That is what makes a rounded-down level
+                    // stop re-announcing itself: the client keeps re-sending `max`,
+                    // the guard compares against `max`, and the display still reads
+                    // `xhigh` because that is what actually runs.
+                    if let Some(client) = store.ante.active.lock().ok().and_then(|slot| slot.clone()) {
+                        let provider = info.provider.id.as_str();
+                        let model = store
+                            .recorded_model(&client)
+                            .map(|record| record.model)
+                            .unwrap_or_else(|| info.model.id.clone());
+                        store.resolve_effort(&client, provider, &model, &effort);
                     }
                 }
                 if let Some(title) = info.title.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
@@ -3335,17 +3455,34 @@ async fn session_model(
     // The client's `default` (and an absent key) both mean "catalog default", so
     // only a named level moves the stored effort.
     let variant = variant_of(&model);
-    // Read the outgoing pair *and* its variant before overwriting either, or
-    // `previous` ends up reporting the new selection back as the old one.
-    let previous = store
-        .ante
-        .model
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .map(|(provider, id)| {
-            json!({ "id": id, "providerID": provider, "variant": store.current_variant() })
-        });
+    // The client commits its model on *every* submit — opencode's `commitModel`
+    // rides along with each prompt — so most of these name exactly what was
+    // already asked for. Announcing those fills the transcript with "Switched …"
+    // rows for a switch nobody made, which reads as the effort level changing
+    // itself mid-conversation. An unchanged request is answered and dropped here.
+    //
+    // The comparison is against what was *asked for*, not what Ante settled on:
+    // a provider rounds `max` down to `xhigh`, and the client keeps re-sending
+    // `max` forever, so comparing against the resolved level would let every
+    // prompt announce the same switch again.
+    let wanted = variant.clone().unwrap_or_else(|| "default".to_string());
+    let recorded = store.recorded_model(&session_id);
+    if let Some(known) = recorded.as_ref()
+        && known.provider == provider
+        && known.model == id
+        && known.wanted == wanted
+    {
+        return axum::http::StatusCode::NO_CONTENT;
+    }
+    // Read the outgoing triple before overwriting anything, or `previous` ends up
+    // reporting the new selection back as the old one. Only the session's own
+    // record is trustworthy here: the process-wide slot may name another session,
+    // which would make the client label the row with a model this conversation
+    // never ran. Unknown means no `previous`, and the client falls back to what it
+    // already has. It reports what actually ran, which is the honest "previous".
+    let previous = recorded.as_ref().map(|known| {
+        json!({ "id": known.model, "providerID": known.provider, "variant": known.resolved })
+    });
     if let Ok(mut slot) = store.ante.model.lock() {
         *slot = Some((provider.clone(), id.clone()));
     }
@@ -3358,27 +3495,36 @@ async fn session_model(
     }
     // The session list and `GET /session/{id}` answer from the stored copy, so
     // the switch has to land there too — otherwise they keep reporting the pair
-    // the session was created with.
-    let reported_variant = store.current_variant();
+    // the session was created with. What it reports is the level that runs: for a
+    // fresh switch nothing has resolved yet, so that is the requested level, and
+    // Ante's echo corrects it if a provider rounds it down.
     if let Ok(mut sessions) = store.sessions.lock()
         && let Some(info) = sessions.iter_mut().find(|s| s["id"] == session_id.as_str())
     {
-        info["model"] =
-            json!({ "id": id.clone(), "providerID": provider.clone(), "variant": reported_variant.clone() });
-    }
-    if let Some(session) = store.ante.active.lock().ok().and_then(|s| s.clone()) {
-        let mut payload = json!({
-            "sessionID": session,
-            "model": { "id": id.clone(), "providerID": provider.clone(), "variant": reported_variant },
+        info["model"] = json!({
+            "id": id.clone(),
+            "providerID": provider.clone(),
+            "variant": wanted.clone(),
         });
-        if let Some(previous) = previous {
-            payload["previous"] = previous;
-        }
-        store.publish_durable("session.model.selected", payload, &session);
     }
-    // Only meaningful once a session exists; the stored pair is applied when the
-    // session starts, and Ante answers "session not initialized" before that.
-    if store.ante.live_id().is_some()
+    store.remember_model(&session_id, &provider, &id, &wanted, &wanted);
+    // The switch belongs to the session the client named, not to whichever one
+    // the event pump happens to be pointed at: a model picked in a session that
+    // is not the live one used to be announced under the live one's id, so the
+    // row appeared in the wrong transcript.
+    let mut payload = json!({
+        "sessionID": session_id,
+        "model": { "id": id.clone(), "providerID": provider.clone(), "variant": wanted },
+    });
+    if let Some(previous) = previous {
+        payload["previous"] = previous;
+    }
+    store.publish_durable("session.model.selected", payload, &session_id);
+    // Ante drives exactly one session per connection, so an `UpdateSession` for
+    // any other id would land on the live session and change *its* model. A
+    // switch for a session that is not attached only lands in the records above;
+    // `attach_session` carries the recorded pair when that session comes back.
+    if store.ante.live_id().as_deref() == Some(session_id.as_str())
         && let Some(ops) = store.ante.ops.lock().await.clone()
     {
         let update = ante_sdk::protocol::SessionUpdate {
@@ -6486,6 +6632,83 @@ mod tests {
         assert_eq!(store.current_variant(), "high");
         switch(json!({ "id": "m" }));
         assert_eq!(store.current_variant(), "default");
+    }
+
+    /// opencode re-commits its model on every submit, so the same request arrives
+    /// over and over. Each of those used to be announced as a switch, which is
+    /// what made the effort level look like it was changing itself mid-sentence:
+    /// the transcript grew a `Switched variant to …` row per prompt.
+    #[test]
+    fn a_repeated_model_commit_is_recognized_as_no_change() {
+        let store = Store::new();
+        store.remember_model("ses_1", "p", "m", "high", "high");
+
+        let same = store.recorded_model("ses_1").expect("the session was recorded");
+        assert_eq!((same.provider.as_str(), same.model.as_str(), same.wanted.as_str()), ("p", "m", "high"));
+
+        // A different level is a real switch, and must not be swallowed.
+        store.remember_model("ses_1", "p", "m", "max", "max");
+        assert_eq!(store.recorded_model("ses_1").map(|record| record.wanted), Some("max".to_string()));
+
+        // The record is per session: one session's model says nothing about another.
+        assert!(store.recorded_model("ses_other").is_none());
+    }
+
+    /// Clearing the level is a state of its own, not an absence of information:
+    /// `default` has to compare equal to a `default` the client re-sends, or the
+    /// guard would fire a switch on every prompt.
+    #[test]
+    fn the_default_level_is_its_own_recorded_state() {
+        let store = Store::new();
+        store.remember_model("ses_1", "p", "m", "default", "medium");
+        let record = store.recorded_model("ses_1").expect("recorded");
+        // The guard compares the request, which is still `default` …
+        assert_eq!(record.wanted, "default");
+        // … while the display shows what Ante settled on.
+        assert_eq!(record.resolved, "medium");
+    }
+
+    /// A provider that cannot honour a level rounds it down, and Ante reports the
+    /// rounded value back. The client keeps re-sending what it asked for, so only
+    /// the request can decide whether this is a new switch. Comparing the resolved
+    /// level instead made every prompt re-announce the same switch — the exact
+    /// symptom this guards against.
+    #[test]
+    fn a_rounded_down_level_does_not_reannounce_itself() {
+        let store = Store::new();
+        store.remember_model("ses_1", "p", "m", "max", "max");
+        store.resolve_effort("ses_1", "p", "m", "xhigh");
+
+        let record = store.recorded_model("ses_1").expect("recorded");
+        assert_eq!(record.wanted, "max", "the request is what repeat submissions match");
+        assert_eq!(record.resolved, "xhigh", "what runs is what gets displayed");
+    }
+
+    /// A session this process never switched still knows what it runs when it was
+    /// created here — the guard reads that copy rather than the process-wide slot,
+    /// which may name a different session entirely.
+    #[test]
+    fn a_created_session_supplies_its_own_model_before_any_switch() {
+        let store = Store::new();
+        if let Ok(mut sessions) = store.sessions.lock() {
+            sessions.push(json!({
+                "id": "ses_1",
+                "model": { "id": "m", "providerID": "p", "variant": "high" },
+            }));
+        }
+        // The process-wide slot belongs to some other session and must be ignored.
+        if let Ok(mut slot) = store.ante.model.lock() {
+            *slot = Some(("other".to_string(), "other-model".to_string()));
+        }
+        assert_eq!(
+            store.recorded_model("ses_1"),
+            Some(RunningModel {
+                provider: "p".to_string(),
+                model: "m".to_string(),
+                wanted: "high".to_string(),
+                resolved: "high".to_string(),
+            })
+        );
     }
 
     /// A server Ante reported without tools is the only failure signal the wire
