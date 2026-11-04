@@ -1,0 +1,42 @@
+# 每次推送到 master、每个 PR 都跑一遍测试。
+#
+# release.yml 用 `workflow_call` 复用这个文件，所以「测试通过」是发版的前置条件，
+# 而不是两条互不相干的流水线——否则 tag 一推就出包，编出来的东西没人验过。
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 缓存 target/ 与 ~/.cargo 的 registry；不加的话每次冷编约 5 分钟。
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --locked
+
+      - name: test
+        run: cargo test --locked
+
+      # 格式与 lint 暂未进门：仓库现状是 `cargo fmt --check` 有 269 处差异、
+      # clippy 有 54 条 warning，直接开这两步会一提交就红。
+      # 把树整理干净后，取消下面两段的注释即可。
+      #
+      # - name: fmt
+      #   run: cargo fmt --check
+      #
+      # - name: clippy
+      #   run: cargo clippy --all-targets --locked -- -D warnings

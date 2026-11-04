@@ -17,7 +17,13 @@ permissions:
   contents: write
 
 jobs:
+  # 复用 ci.yml：两个平台的产物都在这个工作流里出，编之前必须先过测试，
+  # 否则 tag 一推就发布一个没人验过的包。
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   pkg:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +77,7 @@ jobs:
   # 那个脚本只给「同平台」出产物（`item.os !== process.platform` 直接跳过）。
   # runner 是 arm64 的，所以产物是给 Apple Silicon 的（Mac mini 就是这种）。
   macos:
+    needs: ci
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -149,13 +156,27 @@ jobs:
       - name: 看一眼要上传什么
         run: find artifacts -type f | sort
 
+      # 校验和跟产物一起上传，文件名 SHA256SUMS 与 nstatus 一致。
+      # 先把产物收平到一个目录再算，这样文件里只有文件名、没有 artifacts/ 前缀，
+      # 下载后 `sha256sum -c SHA256SUMS` 就能直接跑。
+      # 不签名：要验真得先有可信的公钥分发渠道，自签自验没有意义。
+      - name: 校验和
+        run: |
+          mkdir -p dist
+          find artifacts -type f \( -name '*.pkg.tar.zst' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+          cd dist
+          ls -l
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
       - name: 挂到 Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: |
-            artifacts/arch-pkg/*.pkg.tar.zst
-            artifacts/macos/*.tar.gz
+            dist/*.pkg.tar.zst
+            dist/*.tar.gz
+            dist/SHA256SUMS
           generate_release_notes: true
           # 预览走 prerelease 通道。GitHub 不允许 prerelease 成为 latest，
           # 所以正式版的 `/releases/latest` 不会被它顶掉，这里不必再写 make_latest。
