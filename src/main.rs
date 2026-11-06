@@ -109,6 +109,81 @@ fn settings() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// Serializes the read-modify-write below. Two sessions switching at once must
+/// not both read the old file and then write, or one switch is lost.
+static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Record the user's pick in Ante's own `settings.json`.
+///
+/// Ante persists this pair from its own TUI; nothing on the protocol side does,
+/// so a pick made here lived only in the running session and a restart snapped
+/// back to whatever the file still said — which reads as "the switch didn't
+/// take". Four keys describe the choice, and only those are touched:
+/// `provider`, `model`, the provider's entry in `provider_model` (the model last
+/// used on it), and the model's entry in `model_effort` (`None` removes it, the
+/// way the client's `Default` clears the override). Everything else in the file
+/// belongs to somebody else and is written back as it came.
+fn persist_choice(provider: &str, model: &str, effort: Option<&str>) -> std::io::Result<()> {
+    let _guard = SETTINGS_WRITE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = ante_home().join("settings.json");
+    // A file that does not parse is somebody's half-finished edit: refuse to
+    // rewrite it rather than drop their keys on the floor. A missing one is just
+    // a fresh install, and starts empty.
+    let mut document = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<Value>(&raw).map_err(std::io::Error::other)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(err) => return Err(err),
+    };
+    if !document.is_object() {
+        return Err(std::io::Error::other("settings.json is not an object"));
+    }
+    let before = document.clone();
+    record_choice(&mut document, provider, model, effort);
+    // The client re-commits its model on every prompt; a repeat that lands here
+    // is the same choice again and must not rewrite the file (or move its mtime).
+    if document == before {
+        return Ok(());
+    }
+    let mut body = serde_json::to_string_pretty(&document).map_err(std::io::Error::other)?;
+    body.push('\n');
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, body)?;
+    // Keep the mode the file had: a 0600 settings file must not come back 0644.
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        let _ = std::fs::set_permissions(&temp, metadata.permissions());
+    }
+    std::fs::rename(&temp, &path)
+}
+
+/// The keys `persist_choice` owns, applied to a settings document: the pair
+/// Ante is configured on, the model remembered for that provider, and this
+/// model's effort override (`None` drops it, the way the client's `Default`
+/// clears the level). Every other key is left untouched.
+fn record_choice(document: &mut Value, provider: &str, model: &str, effort: Option<&str>) {
+    let Some(settings) = document.as_object_mut() else {
+        return;
+    };
+    settings.insert("provider".to_string(), json!(provider));
+    settings.insert("model".to_string(), json!(model));
+    if let Some(per_provider) =
+        settings.entry("provider_model").or_insert_with(|| json!({})).as_object_mut()
+    {
+        per_provider.insert(provider.to_string(), json!(model));
+    }
+    if let Some(per_model) =
+        settings.entry("model_effort").or_insert_with(|| json!({})).as_object_mut()
+    {
+        match effort {
+            Some(level) => {
+                per_model.insert(model.to_string(), json!(level));
+            }
+            None => {
+                per_model.remove(model);
+            }
+        }
+    }
+}
+
 /// The pair Ante itself is configured on: `provider` plus that provider's entry
 /// in `provider_model`. The picker is ordered to lead with it, so the client's
 /// default matches what Ante will actually run.
@@ -3474,6 +3549,13 @@ async fn session_model(
     {
         return axum::http::StatusCode::NO_CONTENT;
     }
+    // The pick outlives this process: without it, the next launch came back on
+    // whatever `settings.json` still recorded, which reads as "the switch didn't
+    // take". Written before the switch goes out so the file never describes a
+    // pair this shim has already moved past.
+    if let Err(err) = persist_choice(&provider, &id, variant.as_deref()) {
+        log_line(&format!("model: settings.json 写入失败：{err}"));
+    }
     // Read the outgoing triple before overwriting anything, or `previous` ends up
     // reporting the new selection back as the old one. Only the session's own
     // record is trustworthy here: the process-wide slot may name another session,
@@ -4440,6 +4522,21 @@ async fn session_create(
         && let Ok(mut slot) = store.ante.effort.lock()
     {
         *slot = variant_of(model);
+    }
+    // The first prompt of a session carries the pick the home screen made, so a
+    // choice can arrive here without ever passing through the model switch. It
+    // outlives the process the same way, and a repeat of the stored pair is a
+    // no-op inside `persist_choice`.
+    if let Some(model) = body.as_ref().and_then(|Json(value)| value.get("model"))
+        && let (Some(provider), Some(id)) = (
+            model.get("providerID").and_then(|value| value.as_str()),
+            model.get("id").and_then(|value| value.as_str()),
+        )
+    {
+        let effort = variant_of(model);
+        if let Err(err) = persist_choice(provider, id, effort.as_deref()) {
+            log_line(&format!("session: settings.json 写入失败：{err}"));
+        }
     }
     let info = session_info(&id, "Ante session", store.current_model(), &store.current_variant());
     if let Ok(mut sessions) = store.sessions.lock() {
@@ -6615,6 +6712,47 @@ mod tests {
         assert_eq!(variant_of(&json!({ "id": "m", "variant": "high" })), Some("high".to_string()));
         assert_eq!(variant_of(&json!({ "id": "m", "variant": "default" })), None);
         assert_eq!(variant_of(&json!({ "id": "m" })), None);
+    }
+
+    /// A pick has to outlive the process, so it is written into Ante's own
+    /// `settings.json` — but only the keys that describe it. Anything else in
+    /// that file belongs to the user and must come back untouched.
+    #[test]
+    fn a_pick_is_recorded_without_disturbing_the_rest_of_the_file() {
+        let mut document = json!({
+            "provider": "old-provider",
+            "model": "old-model",
+            "provider_model": { "old-provider": "old-model" },
+            "model_effort": { "old-model": "low", "keep-me": "high" },
+            "theme": "nord",
+            "permissions": { "allow": ["Bash(ls)"] },
+        });
+        record_choice(&mut document, "new-provider", "new-model", Some("max"));
+        assert_eq!(document["provider"], json!("new-provider"));
+        assert_eq!(document["model"], json!("new-model"));
+        // The previous provider's model is remembered, not replaced: the picker
+        // puts you back where you left off when you hop between providers.
+        assert_eq!(document["provider_model"]["old-provider"], json!("old-model"));
+        assert_eq!(document["provider_model"]["new-provider"], json!("new-model"));
+        assert_eq!(document["model_effort"]["new-model"], json!("max"));
+        assert_eq!(document["model_effort"]["old-model"], json!("low"));
+        assert_eq!(document["model_effort"]["keep-me"], json!("high"));
+        assert_eq!(document["theme"], json!("nord"));
+        assert_eq!(document["permissions"]["allow"], json!(["Bash(ls)"]));
+    }
+
+    /// `Default` clears the level rather than naming one, and a document with no
+    /// effort map at all must still take the write.
+    #[test]
+    fn recording_a_cleared_level_drops_the_override() {
+        let mut document = json!({ "model_effort": { "m": "max", "other": "low" } });
+        record_choice(&mut document, "p", "m", None);
+        assert!(document["model_effort"].get("m").is_none());
+        assert_eq!(document["model_effort"]["other"], json!("low"));
+        let mut fresh = json!({});
+        record_choice(&mut fresh, "p", "m", Some("high"));
+        assert_eq!(fresh["model_effort"]["m"], json!("high"));
+        assert_eq!(fresh["provider_model"]["p"], json!("m"));
     }
 
     /// Picking `Default` sends a keyless payload, the same shape as a plain
