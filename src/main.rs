@@ -113,6 +113,19 @@ fn settings() -> Value {
 /// not both read the old file and then write, or one switch is lost.
 static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// What a pick says about the level.
+///
+/// The three are not interchangeable. `/variants` → `Default` is the user
+/// clearing their override, but a session create that carries no level only
+/// means the client named none — reading that as a clear would wipe the level
+/// they saved every time the app starts.
+#[derive(Clone, Copy, Debug)]
+enum EffortChoice<'a> {
+    Keep,
+    Clear,
+    Set(&'a str),
+}
+
 /// Record the user's pick in Ante's own `settings.json`.
 ///
 /// Ante persists this pair from its own TUI; nothing on the protocol side does,
@@ -120,10 +133,13 @@ static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// back to whatever the file still said — which reads as "the switch didn't
 /// take". Four keys describe the choice, and only those are touched:
 /// `provider`, `model`, the provider's entry in `provider_model` (the model last
-/// used on it), and the model's entry in `model_effort` (`None` removes it, the
-/// way the client's `Default` clears the override). Everything else in the file
-/// belongs to somebody else and is written back as it came.
-fn persist_choice(provider: &str, model: &str, effort: Option<&str>) -> std::io::Result<()> {
+/// used on it), and the model's entry in `model_effort`. Everything else in the
+/// file belongs to somebody else and is written back as it came.
+fn persist_choice(
+    provider: &str,
+    model: &str,
+    effort: EffortChoice<'_>,
+) -> std::io::Result<()> {
     let _guard = SETTINGS_WRITE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = ante_home().join("settings.json");
     // A file that does not parse is somebody's half-finished edit: refuse to
@@ -157,9 +173,10 @@ fn persist_choice(provider: &str, model: &str, effort: Option<&str>) -> std::io:
 
 /// The keys `persist_choice` owns, applied to a settings document: the pair
 /// Ante is configured on, the model remembered for that provider, and this
-/// model's effort override (`None` drops it, the way the client's `Default`
-/// clears the level). Every other key is left untouched.
-fn record_choice(document: &mut Value, provider: &str, model: &str, effort: Option<&str>) {
+/// model's effort override. `Keep` leaves the override alone; `Clear` drops it
+/// so the catalog default applies again; `Set` names one. Every other key is
+/// left untouched.
+fn record_choice(document: &mut Value, provider: &str, model: &str, effort: EffortChoice<'_>) {
     let Some(settings) = document.as_object_mut() else {
         return;
     };
@@ -170,16 +187,20 @@ fn record_choice(document: &mut Value, provider: &str, model: &str, effort: Opti
     {
         per_provider.insert(provider.to_string(), json!(model));
     }
+    if matches!(effort, EffortChoice::Keep) {
+        return;
+    }
     if let Some(per_model) =
         settings.entry("model_effort").or_insert_with(|| json!({})).as_object_mut()
     {
         match effort {
-            Some(level) => {
+            EffortChoice::Set(level) => {
                 per_model.insert(model.to_string(), json!(level));
             }
-            None => {
+            EffortChoice::Clear => {
                 per_model.remove(model);
             }
+            EffortChoice::Keep => {}
         }
     }
 }
@@ -3553,7 +3574,11 @@ async fn session_model(
     // whatever `settings.json` still recorded, which reads as "the switch didn't
     // take". Written before the switch goes out so the file never describes a
     // pair this shim has already moved past.
-    if let Err(err) = persist_choice(&provider, &id, variant.as_deref()) {
+    if let Err(err) = persist_choice(
+        &provider,
+        &id,
+        variant.as_deref().map_or(EffortChoice::Clear, EffortChoice::Set),
+    ) {
         log_line(&format!("model: settings.json 写入失败：{err}"));
     }
     // Read the outgoing triple before overwriting anything, or `previous` ends up
@@ -4533,8 +4558,14 @@ async fn session_create(
             model.get("id").and_then(|value| value.as_str()),
         )
     {
-        let effort = variant_of(model);
-        if let Err(err) = persist_choice(provider, id, effort.as_deref()) {
+        let picked = variant_of(model);
+        let effort = match picked.as_deref() {
+            Some(level) => EffortChoice::Set(level),
+            // The client creates a session at startup without naming a level;
+            // that says nothing about the stored one, so it must survive.
+            None => EffortChoice::Keep,
+        };
+        if let Err(err) = persist_choice(provider, id, effort) {
             log_line(&format!("session: settings.json 写入失败：{err}"));
         }
     }
@@ -6727,7 +6758,7 @@ mod tests {
             "theme": "nord",
             "permissions": { "allow": ["Bash(ls)"] },
         });
-        record_choice(&mut document, "new-provider", "new-model", Some("max"));
+        record_choice(&mut document, "new-provider", "new-model", EffortChoice::Set("max"));
         assert_eq!(document["provider"], json!("new-provider"));
         assert_eq!(document["model"], json!("new-model"));
         // The previous provider's model is remembered, not replaced: the picker
@@ -6746,13 +6777,24 @@ mod tests {
     #[test]
     fn recording_a_cleared_level_drops_the_override() {
         let mut document = json!({ "model_effort": { "m": "max", "other": "low" } });
-        record_choice(&mut document, "p", "m", None);
+        record_choice(&mut document, "p", "m", EffortChoice::Clear);
         assert!(document["model_effort"].get("m").is_none());
         assert_eq!(document["model_effort"]["other"], json!("low"));
         let mut fresh = json!({});
-        record_choice(&mut fresh, "p", "m", Some("high"));
+        record_choice(&mut fresh, "p", "m", EffortChoice::Set("high"));
         assert_eq!(fresh["model_effort"]["m"], json!("high"));
         assert_eq!(fresh["provider_model"]["p"], json!("m"));
+    }
+
+    /// The client creates a session at startup without naming a level, and that
+    /// must not be read as the user clearing theirs — it would wipe the saved
+    /// level every launch, which is the bug this whole path exists to fix.
+    #[test]
+    fn a_create_without_a_level_keeps_the_stored_override() {
+        let mut document = json!({ "model_effort": { "m": "max" } });
+        record_choice(&mut document, "p", "m", EffortChoice::Keep);
+        assert_eq!(document["model_effort"]["m"], json!("max"));
+        assert_eq!(document["provider_model"]["p"], json!("m"));
     }
 
     /// Picking `Default` sends a keyless payload, the same shape as a plain
