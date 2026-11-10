@@ -2381,11 +2381,33 @@ async fn attach_session(
     }
     // Resume resolves the permission mode from the host's own settings, so the
     // TUI's `shift+tab` choice has to be put back on the session explicitly.
-    let update = SessionUpdate { permission_mode: Some(mode), ..Default::default() };
+    //
+    // The effort rides along for the same reason, and it has to be *this*
+    // session's level: resuming drops Ante's in-memory level, and the picker
+    // shows the level the session ran at last time. Leaving it out let the two
+    // drift — the TUI said one level, the turn ran at another. A session with
+    // nothing on record is left alone so Ante keeps its own default.
+    let resumed_effort = effort_for_variant(Some(&session_variant(id, &effort_model(store, id))));
+    let mut update = SessionUpdate { permission_mode: Some(mode), ..Default::default() };
+    if resumed_effort.is_some() {
+        // `SessionUpdate` carries effort as part of the model spec; a bare effort
+        // with no model id would be rejected as a half-filled switch.
+        update.model = Some(ante_sdk::protocol::ModelSpec {
+            id: effort_model(store, id),
+            effort: resumed_effort,
+            ..Default::default()
+        });
+    }
     let _ = ops.send(ante_sdk::protocol::op_msg(Op::UpdateSession(update))).await;
     if let Ok(mut live) = store.ante.live.lock() {
         *live = Some(id.to_string());
     }
+}
+
+/// The model a session ran, for looking up its saved level. Falls back to the
+/// one Ante is configured on when the session has no summary of its own.
+fn effort_model(store: &Store, id: &str) -> String {
+    session_meta(id).map(|meta| meta_model(&meta).1).unwrap_or_else(|| store.current_model().1)
 }
 
 /// The permission mode this session should run with: an explicit
