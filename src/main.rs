@@ -1317,6 +1317,10 @@ impl Store {
     /// (`default` when none is set). The session list and `GET /session/{id}`
     /// both report it, and the client reads it back to keep the `/variants`
     /// selection in step.
+    ///
+    /// This is the *committed* value only. Callers that describe a session use
+    /// [`Store::shown_variant`], which also falls back to the level saved on
+    /// disk — a freshly started session has committed nothing yet.
     fn current_variant(&self) -> String {
         self.ante
             .effort
@@ -1324,6 +1328,18 @@ impl Store {
             .ok()
             .and_then(|slot| slot.clone())
             .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// The level to *show* for this session: what the client committed here, or
+    /// else the level saved for the current model.
+    ///
+    /// Reporting `default` for a session that has committed nothing made a
+    /// freshly started session look unset, and the client's next commit then
+    /// dropped the saved level — the picker said Default while turns ran at the
+    /// saved level.
+    fn shown_variant(&self) -> String {
+        let committed = self.ante.effort.lock().ok().and_then(|slot| slot.clone());
+        pick_variant(committed, saved_effort(&self.current_model().1))
     }
 
     /// What *this* session is recorded as running, as
@@ -3562,6 +3578,15 @@ async fn session_model(
     // `max` forever, so comparing against the resolved level would let every
     // prompt announce the same switch again.
     let wanted = variant.clone().unwrap_or_else(|| "default".to_string());
+    if let Some(path) = std::env::var_os("ANTE_SHIM_TRACE") {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(
+                format!("MODEL {session_id} provider={provider} model={id} wanted={wanted}\n")
+                    .as_bytes(),
+            );
+        }
+    }
     let recorded = store.recorded_model(&session_id);
     if let Some(known) = recorded.as_ref()
         && known.provider == provider
@@ -4548,12 +4573,16 @@ async fn session_create(
         *slot = Some((provider.to_string(), id.to_string()));
     }
     // A variant on the create payload is the same effort pick the model switch
-    // carries, with the same meaning: the payload's choice wins outright, and a
-    // create that names no level clears any leftover one.
+    // carries, with the same meaning: the payload's choice wins outright. A
+    // create that names *no* level says nothing, though — the client sends that
+    // on startup — so the slot keeps whatever was already in force instead of
+    // being cleared. Clearing it made the live session answer `default`, the
+    // client re-commit that "no level", and `persist_choice` drop the saved one.
     if let Some(model) = body.as_ref().and_then(|Json(value)| value.get("model"))
+        && let Some(picked) = variant_of(model)
         && let Ok(mut slot) = store.ante.effort.lock()
     {
-        *slot = variant_of(model);
+        *slot = Some(picked);
     }
     // The first prompt of a session carries the pick the home screen made, so a
     // choice can arrive here without ever passing through the model switch. It
@@ -4576,7 +4605,7 @@ async fn session_create(
             log_line(&format!("session: settings.json 写入失败：{err}"));
         }
     }
-    let info = session_info(&id, "Ante session", store.current_model(), &store.current_variant());
+    let info = session_info(&id, "Ante session", store.current_model(), &store.shown_variant());
     if let Ok(mut sessions) = store.sessions.lock() {
         sessions.push(info.clone());
     }
@@ -4617,16 +4646,20 @@ fn meta_model(meta: &Value) -> (String, String) {
 /// the saved level: the picker drew an unset override and the client, seeing
 /// nothing, re-committed "no level" and wiped it for real.
 fn session_variant(id: &str, model: &str) -> String {
-    let saved = settings();
-    let saved = saved.get("model_effort").and_then(|per_model| per_model.get(model));
-    pick_variant(recorded_effort(id), saved)
+    pick_variant(recorded_effort(id), saved_effort(model))
+}
+
+/// The level saved for one model in `settings.json`, as a JSON value so
+/// [`pick_variant`] can reject a non-string.
+fn saved_effort(model: &str) -> Option<Value> {
+    settings().get("model_effort").and_then(|per_model| per_model.get(model)).cloned()
 }
 
 /// [`session_variant`] with both sources passed in, so the precedence can be
 /// tested without a home directory.
-fn pick_variant(recorded: Option<String>, saved: Option<&Value>) -> String {
+fn pick_variant(recorded: Option<String>, saved: Option<Value>) -> String {
     recorded
-        .or_else(|| saved.and_then(Value::as_str).map(str::to_string))
+        .or_else(|| saved.as_ref().and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| "default".to_string())
 }
 
@@ -4710,7 +4743,7 @@ async fn session_get(State(store): State<Store>, Path(id): Path<String>) -> Json
     let mut info = store
         .session(&id)
         .or_else(|| ante_session_info(&id))
-        .unwrap_or_else(|| session_info(&id, "Ante session", store.current_model(), &store.current_variant()));
+        .unwrap_or_else(|| session_info(&id, "Ante session", store.current_model(), &store.shown_variant()));
     // A staged undo lives in this process, and the client only learns about it
     // from the event that announced it — which is gone after a restart. Reporting
     // it here is what keeps `/redo` (and the "N messages will be reverted" strip)
@@ -5232,7 +5265,7 @@ async fn session_export(State(store): State<Store>, Path(id): Path<String>) -> J
         .session(&id)
         .or_else(|| ante_session_info(&id))
         .unwrap_or_else(|| {
-            session_info(&id, &derived_title(&archive), store.current_model(), &store.current_variant())
+            session_info(&id, &derived_title(&archive), store.current_model(), &store.shown_variant())
         });
     let messages = replay_session(&archive, &store.handed());
     Json(json!({ "data": { "info": info, "messages": messages } }))
@@ -6902,11 +6935,11 @@ mod tests {
     #[test]
     fn the_shown_variant_prefers_the_log_then_the_saved_level() {
         let saved = json!("max");
-        assert_eq!(pick_variant(Some("high".into()), Some(&saved)), "high");
-        assert_eq!(pick_variant(None, Some(&saved)), "max");
+        assert_eq!(pick_variant(Some("high".into()), Some(saved.clone())), "high");
+        assert_eq!(pick_variant(None, Some(saved.clone())), "max");
         assert_eq!(pick_variant(None, None), "default");
         // A non-string in the file is not a level; it must not leak through.
-        assert_eq!(pick_variant(None, Some(&json!(3))), "default");
+        assert_eq!(pick_variant(None, Some(json!(3))), "default");
     }
 
     /// Picking `Default` sends a keyless payload, the same shape as a plain
