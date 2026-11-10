@@ -4597,9 +4597,50 @@ fn meta_model(meta: &Value) -> (String, String) {
 /// The session's own metadata, read back from Ante. Returning a synthesized one
 /// loses the real directory, and the client uses that to decide whether the
 /// session belongs to the location it is showing.
+/// The level a session is running, as Ante last reported it back.
+///
+/// `meta.json` records the provider and model but never the effort — an
+/// `UpdateSession` stays in memory — so the only durable answer is the last
+/// `SessionUpdated` in the session's own log. It reports what Ante *resolved* to,
+/// which is what the client should draw. The walk is backwards from the end so a
+/// multi-megabyte log costs one parse, not thousands.
+fn recorded_effort(id: &str) -> Option<String> {
+    let path = ante_home().join("sessions").join(id).join("events.jsonl");
+    recorded_effort_at(&path)
+}
+
+/// [`recorded_effort`] on an explicit log path, so it can be tested without
+/// pointing the whole process at a temporary home.
+fn recorded_effort_at(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    for line in raw.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(updated) = entry.get("event").and_then(|event| event.get("SessionUpdated"))
+        else {
+            continue;
+        };
+        if let Some(effort) =
+            updated.get("model").and_then(|model| model.get("effort")).and_then(Value::as_str)
+        {
+            return Some(effort.to_string());
+        }
+    }
+    None
+}
+
+/// The session's own metadata, read back from Ante. Returning a synthesized one
+/// loses the real directory, and the client uses that to decide whether the
+/// session belongs to the location it is showing.
+///
+/// `variant` has to travel with the model: the client reads it back to draw its
+/// `/variants` selection, and a model without one shows as `Default` however hard
+/// the session is actually thinking.
 fn ante_session_info(id: &str) -> Option<Value> {
     let meta = session_meta(id)?;
     let (provider, model) = meta_model(&meta);
+    let variant = recorded_effort(id).unwrap_or_else(|| "default".to_string());
     let created = meta
         .get("started_time")
         .and_then(|v| v.as_str())
@@ -4615,7 +4656,7 @@ fn ante_session_info(id: &str) -> Option<Value> {
         "id": id,
         "projectID": "prj_shim",
         "agent": reported_agent(),
-        "model": { "id": model, "providerID": provider },
+        "model": { "id": model, "providerID": provider, "variant": variant },
         "cost": 0,
         "tokens": tokens_json(
             usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
@@ -6795,6 +6836,30 @@ mod tests {
         record_choice(&mut document, "p", "m", EffortChoice::Keep);
         assert_eq!(document["model_effort"]["m"], json!("max"));
         assert_eq!(document["provider_model"]["p"], json!("m"));
+    }
+
+    /// A session's level lives only in its event log, so it is read back from
+    /// the last `SessionUpdated`. Missing, empty, and truncated-but-unparsable
+    /// logs all mean "nothing recorded", never a panic.
+    #[test]
+    fn the_recorded_effort_is_the_last_one_ante_reported() {
+        let home = std::env::temp_dir().join(format!("antex-effort-{}", std::process::id()));
+        let dir = home.join("sessions").join("ses_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |effort: &str| {
+            format!(
+                r#"{{"timestamp":"t","id":"e","event":{{"SessionUpdated":{{"model":{{"id":"m","effort":"{effort}"}}}}}}}}"#
+            )
+        };
+        let log = dir.join("events.jsonl");
+        std::fs::write(&log, format!("{}\n{}\n", line("high"), line("max"))).unwrap();
+        assert_eq!(recorded_effort_at(&log), Some("max".to_string()));
+        // A log with no `SessionUpdated` at all, and one that does not exist,
+        // both answer "unknown" rather than inventing a level.
+        std::fs::write(&log, "{\"event\":{\"TurnStart\":{}}}\n").unwrap();
+        assert_eq!(recorded_effort_at(&log), None);
+        assert_eq!(recorded_effort_at(&dir.join("missing.jsonl")), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Picking `Default` sends a keyless payload, the same shape as a plain
