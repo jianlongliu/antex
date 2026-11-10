@@ -4424,7 +4424,14 @@ fn ante_sessions() -> Vec<Value> {
                 "id": id,
                 "projectID": "prj_shim",
                 "agent": reported_agent(),
-                "model": { "id": model, "providerID": provider },
+                "model": {
+                    "id": model,
+                    "providerID": provider,
+                    // The picker draws its `/variants` selection from this, so it
+                    // has to answer with the level that will run even before the
+                    // session has a log of its own.
+                    "variant": session_variant(&dir, &model),
+                },
                 "cost": 0,
                 "tokens": tokens,
                 "time": { "created": created, "updated": created },
@@ -4597,6 +4604,32 @@ fn meta_model(meta: &Value) -> (String, String) {
 /// The session's own metadata, read back from Ante. Returning a synthesized one
 /// loses the real directory, and the client uses that to decide whether the
 /// session belongs to the location it is showing.
+/// The level a session should *show*, which is not always one Ante echoed back.
+///
+/// Order matters:
+/// 1. what Ante last resolved for this session (the log) — the truth for a
+///    session that has run;
+/// 2. the level saved for this model in `settings.json` — a fresh session has no
+///    log yet, but the user's saved pick is what will actually run;
+/// 3. `default`, meaning nothing overrides the catalog.
+///
+/// Skipping step 2 is what made a restart show `Default` while the turn ran at
+/// the saved level: the picker drew an unset override and the client, seeing
+/// nothing, re-committed "no level" and wiped it for real.
+fn session_variant(id: &str, model: &str) -> String {
+    let saved = settings();
+    let saved = saved.get("model_effort").and_then(|per_model| per_model.get(model));
+    pick_variant(recorded_effort(id), saved)
+}
+
+/// [`session_variant`] with both sources passed in, so the precedence can be
+/// tested without a home directory.
+fn pick_variant(recorded: Option<String>, saved: Option<&Value>) -> String {
+    recorded
+        .or_else(|| saved.and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// The level a session is running, as Ante last reported it back.
 ///
 /// `meta.json` records the provider and model but never the effort — an
@@ -4640,7 +4673,7 @@ fn recorded_effort_at(path: &std::path::Path) -> Option<String> {
 fn ante_session_info(id: &str) -> Option<Value> {
     let meta = session_meta(id)?;
     let (provider, model) = meta_model(&meta);
-    let variant = recorded_effort(id).unwrap_or_else(|| "default".to_string());
+    let variant = session_variant(id, &model);
     let created = meta
         .get("started_time")
         .and_then(|v| v.as_str())
@@ -6860,6 +6893,20 @@ mod tests {
         assert_eq!(recorded_effort_at(&log), None);
         assert_eq!(recorded_effort_at(&dir.join("missing.jsonl")), None);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A session's own log wins, because it records what Ante *resolved* to. With
+    /// no log, the level saved for the model answers instead — that is what a
+    /// turn will run at, and reporting `default` there makes the client re-commit
+    /// "no level" and wipe the saved one.
+    #[test]
+    fn the_shown_variant_prefers_the_log_then_the_saved_level() {
+        let saved = json!("max");
+        assert_eq!(pick_variant(Some("high".into()), Some(&saved)), "high");
+        assert_eq!(pick_variant(None, Some(&saved)), "max");
+        assert_eq!(pick_variant(None, None), "default");
+        // A non-string in the file is not a level; it must not leak through.
+        assert_eq!(pick_variant(None, Some(&json!(3))), "default");
     }
 
     /// Picking `Default` sends a keyless payload, the same shape as a plain
