@@ -544,6 +544,9 @@ async fn opencode(keys: &[&str]) -> Result<Quota, String> {
 
 /// console 的 `/api/go/status` 与用量接口的 meter 形状：`access.meters.{fiveHour,week,month}`
 /// 记的是微分（micro-cents）。
+///
+/// `zen/go/v1/usage` 现在另给一套按百分比计的形状：`usage.{rolling,weekly,monthly}`，
+/// 每项是 `percent`（已经是 0–100）+ RFC3339 的 `resetsAt`。先认旧形状，没有再看这套。
 fn console_block(body: &Value) -> Quota {
     let meters = body
         .get("access")
@@ -564,6 +567,25 @@ fn console_block(body: &Value) -> Quota {
             used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
             reset_ms: meter.get("resetAt").and_then(Value::as_i64),
         });
+    }
+    if rows.is_empty() {
+        let windows = body.get("usage").and_then(Value::as_object);
+        for (raw, label) in [("rolling", "5h"), ("weekly", "W"), ("monthly", "M")] {
+            let Some(window) = windows.and_then(|windows| windows.get(raw)) else {
+                continue;
+            };
+            let Some(percent) = window.get("percent").and_then(Value::as_f64) else {
+                continue;
+            };
+            rows.push(Row::Window {
+                label: label.to_string(),
+                used_percent: percent.clamp(0.0, 100.0),
+                reset_ms: window
+                    .get("resetsAt")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339_ms),
+            });
+        }
     }
     Quota {
         available: !rows.is_empty(),
@@ -1011,6 +1033,33 @@ mod tests {
         assert_eq!(countdown(Some(now_ms() + 3 * 3_600_000 + 1_200_000)), "3h 20m");
         assert_eq!(countdown(Some(now_ms() + 2 * 86_400_000 + 3 * 3_600_000)), "2d 3h");
         assert_eq!(countdown(None), "");
+    }
+
+    /// zen 的用量接口按百分比给窗口；重置时间是 RFC3339，要换成本地倒计时用的毫秒。
+    #[test]
+    fn opencode_percent_windows_are_read_from_usage() {
+        let body = json!({
+            "usage": {
+                "rolling": {"status": "ok", "percent": 12.5, "resetsAt": "2026-11-11T23:27:21.000Z"},
+                "weekly": {"status": "ok", "percent": 0, "resetsAt": "2026-11-16T00:00:00.000Z"},
+                "monthly": {"status": "ok", "percent": 100, "resetsAt": "2026-12-11T11:53:32.000Z"}
+            }
+        });
+        let quota = console_block(&body);
+        assert!(quota.available);
+        let rows: Vec<(&str, f64, bool)> = quota
+            .rows
+            .iter()
+            .map(|row| match row {
+                Row::Window {
+                    label,
+                    used_percent,
+                    reset_ms,
+                } => (label.as_str(), *used_percent, reset_ms.is_some()),
+                Row::Value { .. } => panic!("unexpected value row"),
+            })
+            .collect();
+        assert_eq!(rows, vec![("5h", 12.5, true), ("W", 0.0, true), ("M", 100.0, true)]);
     }
 
     /// 表里那几家的 id 必须能在 catalog 里找到同名的（表头对不上就是打错字了）。
