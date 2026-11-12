@@ -6168,6 +6168,21 @@ async fn main() {
     // The client must not outlive us: an orphan TUI keeps the terminal in raw
     // mode, where even Ctrl+C produces no signal to get out with.
     terminal::die_with_parent(&mut command);
+    // Pin the client's update check off. It compares the version the client
+    // reports against opencode.ai's release for its channel; this package's
+    // build reports `0.0.0-makepkg-<timestamp>` (`antex-tui --version`), a
+    // version no release channel knows. Measured 2026-11-12: the endpoint for
+    // that channel answers 404 "Artifact not found", so nothing is shown today
+    // — but that is the network's answer, not a guarantee, and the client would
+    // render a "/update to install v…" line on the home screen the moment it
+    // changed. Pinning it here makes that impossible regardless.
+    // `/update` could never work on this package anyway: its install paths only
+    // know the curl/Homebrew/winget/npm layouts (`cli/src/services/updater.ts`,
+    // `method()`), not a pacman-owned file, so it only ever answers "Could not
+    // detect the installation method". Updating means a new package from CI,
+    // not self-modifying `/usr/bin`. Set unconditionally, so the outcome does
+    // not depend on the caller's environment.
+    command.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
     if let Some(config) = client_config_from_disk() {
         command.env("OPENCODE_CLI_CONFIG_CONTENT", config);
     }
