@@ -5195,14 +5195,48 @@ async fn session_messages(
     // archive Ante opened for it, so that is what gets read back.
     let archive = store.ante.archive_of(&id).unwrap_or_else(|| id.clone());
     let mut data = replay_session(&archive, &store.handed());
-    // The transcript is read newest-first with a limit; honour both.
-    if params.get("order").map(|value| value == "desc").unwrap_or(false) {
-        data.reverse();
-    }
     let cursor_arg = params.get("cursor").map(String::as_str);
     let limit = params.get("limit").and_then(|value| value.parse::<usize>().ok());
-    let (data, cursor) = paginate_messages(data, cursor_arg, limit);
+    // The ordering has to be recovered from the cursor, not from `order`, because
+    // the client sends it only on the first request: it opens a session with
+    // `limit=20&order=desc`, then walks history with `limit=20&cursor=…` and no
+    // `order` at all (`client/src/solid/data.ts`, `loadMore`). Ordering by the
+    // request alone therefore flipped the list from newest-first to oldest-first
+    // on the second page, so the cursor — an id from the *newest* end — matched a
+    // row near the *oldest* end, the page came back full of rows already shown,
+    // and `next` was absent. Paging died on page two: measured 2026-11-13,
+    // scrolling stopped after 39 of 311 rows.
+    let descending = match cursor_arg.filter(|value| !value.is_empty()) {
+        Some(anchor) => cursor_is_descending(anchor),
+        None => params.get("order").map(|value| value == "desc").unwrap_or(false),
+    };
+    if descending {
+        data.reverse();
+    }
+    let (data, cursor) = paginate_messages(data, cursor_arg, limit, descending);
     Json(json!({ "data": data, "cursor": cursor }))
+}
+
+/// The direction a cursor was minted under, read back from its own text.
+///
+/// Cursors are `<flag>:<row id>`, where the flag is `d` for newest-first and `a`
+/// for oldest-first. A bare id (what this shim emitted before the direction was
+/// carried, and what a hand-written curl still sends) is read as descending,
+/// because that is how the client opens every session and the only ordering a
+/// reader pages back through.
+fn cursor_is_descending(cursor: &str) -> bool {
+    match cursor.split_once(':') {
+        Some((flag, _)) => flag != "a",
+        None => true,
+    }
+}
+
+/// Split a cursor into its direction flag and the row id it anchors to.
+fn cursor_anchor(cursor: &str) -> &str {
+    match cursor.split_once(':') {
+        Some((_, anchor)) => anchor,
+        None => cursor,
+    }
 }
 
 /// One page of a transcript, plus the cursor that asks for the next one.
@@ -5229,34 +5263,39 @@ async fn session_messages(
 /// unparsable one starts from the top rather than failing, because the honest
 /// fallback for "where was I" is "the beginning", and a dead session view is
 /// worse than a repeated page.
-fn paginate_messages(mut data: Vec<Value>, cursor: Option<&str>, limit: Option<usize>) -> (Vec<Value>, Value) {
-    // Rows after the cursor's row. The cursor names a row this shim already
-    // handed out, so the next page starts at the one following it; a cursor that
-    // no longer matches anything (the log was rewritten, or it came from another
-    // session) degrades to "start over" instead of an empty page that would end
-    // paging for good.
-    // Whether a further page exists has to be decided from the full list, before
-    // truncation, not from the page that is being returned.
+fn paginate_messages(
+    mut data: Vec<Value>,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    descending: bool,
+) -> (Vec<Value>, Value) {
+    // Rows after the cursor's row, in the same ordering the caller is reading.
+    // The cursor names a row this shim already handed out, so the next page
+    // starts at the one following it; a cursor that no longer matches anything
+    // (the log was rewritten, or it came from another session) degrades to "start
+    // over" instead of an empty page that would end paging for good.
     let mut rest: Vec<Value> = match cursor.filter(|value| !value.is_empty()) {
-        Some(anchor) => {
+        Some(raw) => {
+            let anchor = cursor_anchor(raw);
             let position = data
                 .iter()
                 .position(|row| row.get("id").and_then(Value::as_str) == Some(anchor));
             match position {
                 Some(index) => data.split_off(index + 1),
-                // An unmatched cursor is stale: start over rather than answering
-                // empty, which the client would read as "no more history".
                 None => data,
             }
         }
         None => data,
     };
+    // Whether a further page exists has to be decided from the full list, before
+    // truncation, not from the page being returned.
     let more = limit.map(|limit| rest.len() > limit).unwrap_or(false);
     if let Some(limit) = limit {
         rest.truncate(limit);
     }
+    let flag = if descending { "d" } else { "a" };
     let cursor = match rest.last().and_then(|row| row.get("id")).and_then(Value::as_str) {
-        Some(last) if more => json!({ "next": last }),
+        Some(last) if more => json!({ "next": format!("{flag}:{last}") }),
         _ => json!({}),
     };
     (rest, cursor)
@@ -6349,7 +6388,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         let mut pages = 0;
         loop {
-            let (page, next) = paginate_messages(all.clone(), cursor.as_deref(), Some(20));
+            let (page, next) = paginate_messages(all.clone(), cursor.as_deref(), Some(20), true);
             pages += 1;
             assert!(pages < 100, "paging never reached the end");
             seen.extend(
@@ -6381,7 +6420,7 @@ mod tests {
         let mut all: Vec<Value> = (0..100)
             .map(|index| json!({ "id": format!("m{index:03}") }))
             .collect();
-        let (first, next) = paginate_messages(all.clone(), None, Some(20));
+        let (first, next) = paginate_messages(all.clone(), None, Some(20), true);
         assert_eq!(first.len(), 20);
         let anchor = next["next"].as_str().unwrap().to_string();
 
@@ -6392,7 +6431,7 @@ mod tests {
         fresh.extend(all);
         all = fresh;
 
-        let (second, _) = paginate_messages(all, Some(&anchor), Some(20));
+        let (second, _) = paginate_messages(all, Some(&anchor), Some(20), true);
         let ids: Vec<&str> = second.iter().map(|row| row["id"].as_str().unwrap()).collect();
         assert_eq!(
             ids[0], "m020",
@@ -6402,13 +6441,65 @@ mod tests {
     }
 
     #[test]
+    fn paging_survives_the_client_dropping_the_order_parameter() {
+        // The client sends `order=desc` on the first request and then walks history
+        // with `limit=20&cursor=…` and no `order` at all. Ordering used to follow
+        // the request, so page two flipped to oldest-first while the cursor still
+        // named a row near the newest end; the page came back full of rows already
+        // on screen and carried no `next`, and scrolling died on page two. Measured
+        // 2026-11-13: 39 of 311 rows, then nothing for the rest of the session.
+        let last = 60;
+        let ascending: Vec<Value> = (0..last).map(|index| json!({ "id": format!("m{index}") })).collect();
+        // The first request: newest first, exactly what the shim serves for
+        // `order=desc` before pagination.
+        let mut page_input = ascending.clone();
+        page_input.reverse();
+        let (first, next) = paginate_messages(page_input, None, Some(20), true);
+        assert_eq!(first.len(), 20);
+        let mut cursor = next["next"].as_str().unwrap().to_string();
+        // 60 rows newest-first: the first page is m59..m40, so the boundary is m40.
+        assert_eq!(cursor, "d:m40", "the cursor must record the direction it came from");
+
+        // Every later request: no `order`, ordering recovered from the cursor.
+        let mut seen: Vec<String> = first
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        let mut pages = 1;
+        while !cursor.is_empty() {
+            let descending = cursor_is_descending(&cursor);
+            assert!(descending, "a bare page walk stays newest-first");
+            let mut input = ascending.clone();
+            if descending {
+                input.reverse();
+            }
+            let (page, next) = paginate_messages(input, Some(&cursor), Some(20), descending);
+            pages += 1;
+            assert!(pages < 20, "paging never reached the end");
+            assert!(!page.is_empty(), "page {pages} came back empty, which ends paging");
+            let ids: Vec<String> = page
+                .iter()
+                .map(|row| row["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                ids.iter().all(|id| !seen.contains(id)),
+                "page {pages} repeated rows already on screen"
+            );
+            seen.extend(ids);
+            cursor = next["next"].as_str().unwrap_or("").to_string();
+        }
+        assert_eq!(seen.len(), last as usize, "the walk must reach every row");
+        assert_eq!(seen.last().unwrap(), "m0", "and end on the oldest one");
+    }
+
+    #[test]
     fn a_short_transcript_answers_with_no_next_cursor() {
         let all: Vec<Value> = (0..5).map(|index| json!({ "id": format!("m{index}") })).collect();
-        let (page, cursor) = paginate_messages(all.clone(), None, Some(20));
+        let (page, cursor) = paginate_messages(all.clone(), None, Some(20), true);
         assert_eq!(page.len(), 5);
         assert_eq!(cursor, json!({}), "an exhausted transcript must not ask for more");
         // No limit at all (the shim's own curl-friendly default) is one page too.
-        let (page, cursor) = paginate_messages(all, None, None);
+        let (page, cursor) = paginate_messages(all, None, None, true);
         assert_eq!(page.len(), 5);
         assert_eq!(cursor, json!({}));
     }
@@ -6418,14 +6509,14 @@ mod tests {
         // Exactly one page, and one page plus one row: the cursor must appear only
         // when a further page actually exists, or the client keeps asking.
         let exact: Vec<Value> = (0..20).map(|index| json!({ "id": format!("m{index}") })).collect();
-        let (page, cursor) = paginate_messages(exact, None, Some(20));
+        let (page, cursor) = paginate_messages(exact, None, Some(20), true);
         assert_eq!(page.len(), 20);
         assert_eq!(cursor, json!({}), "an exactly-full last page has nothing after it");
 
         let one_more: Vec<Value> = (0..21).map(|index| json!({ "id": format!("m{index}") })).collect();
-        let (page, cursor) = paginate_messages(one_more, None, Some(20));
+        let (page, cursor) = paginate_messages(one_more, None, Some(20), true);
         assert_eq!(page.len(), 20);
-        assert_eq!(cursor["next"], json!("m19"));
+        assert_eq!(cursor["next"], json!("d:m19"));
     }
 
     #[test]
@@ -6434,9 +6525,9 @@ mod tests {
         // page would tell the client there is no older history and freeze the view.
         let all: Vec<Value> = (0..30).map(|index| json!({ "id": format!("m{index}") })).collect();
         for bad in ["not-an-id", "", "gone"] {
-            let (page, cursor) = paginate_messages(all.clone(), Some(bad), Some(20));
+            let (page, cursor) = paginate_messages(all.clone(), Some(bad), Some(20), true);
             assert_eq!(page[0]["id"], json!("m0"), "cursor {bad:?} should restart at the top");
-            assert_eq!(cursor["next"], json!("m19"));
+            assert_eq!(cursor["next"], json!("d:m19"));
         }
     }
 
