@@ -5199,10 +5199,48 @@ async fn session_messages(
     if params.get("order").map(|value| value == "desc").unwrap_or(false) {
         data.reverse();
     }
-    if let Some(limit) = params.get("limit").and_then(|value| value.parse::<usize>().ok()) {
+    let cursor_arg = params.get("cursor").map(String::as_str);
+    let limit = params.get("limit").and_then(|value| value.parse::<usize>().ok());
+    let (data, cursor) = paginate_messages(data, cursor_arg, limit);
+    Json(json!({ "data": data, "cursor": cursor }))
+}
+
+/// One page of a transcript, plus the cursor that asks for the next one.
+///
+/// Paging has to actually work, or long conversations lose their beginning: the
+/// client opens a session with `limit=20&order=desc` and only ever asks for more
+/// when the previous answer carried `cursor.next` (`client/src/solid/data.ts`,
+/// `loadMore`). This used to answer a bare `{}` for every request, so `more()`
+/// stayed false forever and scrolling to the top simply stopped — a 1358-row
+/// session showed its newest 20 rows and nothing older, which reads as "my
+/// earlier messages are gone".
+///
+/// The cursor is the offset into the ordering the caller asked for. It is opaque
+/// to the client, which only echoes it back, so any stable encoding works; a
+/// plain number keeps it readable in a log. An out-of-range or unparsable cursor
+/// starts from the top rather than failing, because the honest fallback for
+/// "where was I" is "the beginning" and a dead session view is worse than a
+/// repeated page.
+fn paginate_messages(data: Vec<Value>, cursor: Option<&str>, limit: Option<usize>) -> (Vec<Value>, Value) {
+    let offset = cursor
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let total = data.len();
+    let mut data: Vec<Value> = if offset > 0 {
+        data.into_iter().skip(offset).collect()
+    } else {
+        data
+    };
+    if let Some(limit) = limit {
         data.truncate(limit);
     }
-    Json(json!({ "data": data, "cursor": {} }))
+    let consumed = offset.saturating_add(data.len());
+    let cursor = if consumed < total {
+        json!({ "next": consumed.to_string() })
+    } else {
+        json!({})
+    };
+    (data, cursor)
 }
 
 /// A refusal the client shows verbatim: `message` is what it puts in the toast.
@@ -6280,6 +6318,55 @@ async fn fallback() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transcript_pages_back_to_its_beginning_without_losing_or_repeating_a_row() {
+        // The client reads a session newest-first and stops asking the moment an
+        // answer has no `cursor.next`, so a transcript longer than one page used
+        // to be its newest page and nothing else (2026-11-12: a 1358-row session
+        // showed 20 rows and scrolling up just stopped).
+        let all: Vec<Value> = (0..1358).map(|index| json!({ "id": index })).collect();
+        let mut seen: Vec<i64> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let (page, next) = paginate_messages(all.clone(), cursor.as_deref(), Some(20));
+            pages += 1;
+            assert!(pages < 100, "paging never reached the end");
+            seen.extend(page.iter().map(|row| row["id"].as_i64().unwrap()));
+            match next.get("next").and_then(Value::as_str) {
+                Some(value) => cursor = Some(value.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 68); // 1358 rows at 20 per page, last page short
+        assert_eq!(seen.len(), all.len(), "a row went missing between pages");
+        // Ascending and unique: no page repeated the one before it.
+        assert_eq!(seen, (0..1358).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_short_transcript_answers_with_no_next_cursor() {
+        let all: Vec<Value> = (0..5).map(|index| json!({ "id": index })).collect();
+        let (page, cursor) = paginate_messages(all.clone(), None, Some(20));
+        assert_eq!(page.len(), 5);
+        assert_eq!(cursor, json!({}), "an exhausted transcript must not ask for more");
+        // No limit at all (the shim's own curl-friendly default) is one page too.
+        let (page, cursor) = paginate_messages(all, None, None);
+        assert_eq!(page.len(), 5);
+        assert_eq!(cursor, json!({}));
+    }
+
+    #[test]
+    fn an_unusable_cursor_starts_over_instead_of_failing() {
+        // A stale or hand-mangled cursor must not blank the session view.
+        let all: Vec<Value> = (0..30).map(|index| json!({ "id": index })).collect();
+        for bad in ["not-a-number", "", "-1"] {
+            let (page, cursor) = paginate_messages(all.clone(), Some(bad), Some(20));
+            assert_eq!(page[0]["id"], json!(0), "cursor {bad:?} should restart at the top");
+            assert_eq!(cursor["next"], json!("20"));
+        }
+    }
 
     #[test]
     fn tools_the_client_draws_get_its_name() {
