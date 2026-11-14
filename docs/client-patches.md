@@ -21,9 +21,11 @@
   - `packages/tui/src/context/keymap.tsx` —— `useCommands()` 里加一张黑名单（按 slash 名 / 命令 id 匹配），把 Ante 做不了的命令从**命令面板与斜杠补全一次摘掉**（两处都从这份 entry 列表生成，所以只改这一处）。名单：~~`mcps`~~、~~`undo`~~、~~`redo`~~（2026-10-22 撤出——前者 Ante 会报 MCP 服务器，后两者对应 `Op::RewindSession`，见 [implementation.md](implementation.md)）`status` `pair` `reload` `share` `fork` `unshare` `worktrees` `terminal` `update` `restart` `session.background`。（`rename`/`copy`/`export`/`skills` 2026-10-02 起撤出名单——垫片有真接口了；`connect` 2026-10-14 起撤出，理由见下。）
   - `packages/tui/src/component/dialog-integration.tsx` —— `INTEGRATION_PRIORITY` 里补上 Ante 的 provider id（`openai-subscription` / `anthropic-subscription` / `antix`）。上游那张表只认它自己的 id，于是「Popular」被 API key 那些占满，**真正要登录的两项（ChatGPT、Antix）被压到「Services」里按字母排序**；补完就在最上面。只动这张表一行，不改逻辑。
   - `packages/client/src/solid/data.ts`（`session.revert.committed` 一处，见 [implementation.md](implementation.md) 的「回溯」：上游按 id 字符串切行，而 Ante 的两种 id 形态不按字典序排，改成按边界行位置切）
-  - `packages/client/src/solid/data.ts`（两处，见 [implementation.md](implementation.md) 的「记录回读」）—— ① `message.sync` 不再把「这次 read 没提到的行」删掉，保留后**按 `time.created` 插回原位**（`mergeHeldRows`：一律追加到末尾会把还没被 Ante 读走的那条挂在模型后续步骤**下面**，看着像顺序错）；垫片那份 transcript 来自 Ante 的日志，客户端自己从事件折出来的行（idle / compaction / 切换 / 正在流的那一步 / 待递送的 prompt）不在里面，原先的 reconcile 一读就抹。② `editText` 在没有 text part 时补建一个空 part，使重读忽然插进「一句话正流到一半」时后续 delta 仍有处可落（否则那一步的回答永远不显示）。
+  - `packages/client/src/solid/data.ts`（两处，见 [implementation.md](implementation.md) 的「记录回读」）—— ① `message.sync` 不再把「这次 read 没提到的行」删掉，保留后**按 `time.created` 插回原位**（`mergeHeldRows`：一律追加到末尾会把还没被 Ante 读走的那条挂在模型后续步骤**下面**，看着像顺序错）；垫片那份 transcript 来自 Ante 的日志，客户端自己从事件折出来的行（idle / compaction / 正在流的那一步 / 待递送的 prompt）不在里面，原先的 reconcile 一读就抹。**`agent-switched` 是例外**：上游 `solid-eviction.test.ts` 钉住它不跨重读，所以保留集里排除了这个类型。② `editText` 在没有 text part 时补建一个空 part，使重读忽然插进「一句话正流到一半」时后续 delta 仍有处可落（否则那一步的回答永远不显示）。
+  - `packages/tui/test/fixture/tui-client.ts` —— **测试基建**：侧栏额度面板会请求 `/api/rpc/antex.quota/panel`，而上游 fixture 对未知请求直接抛错；补一条 `{output:null}`，否则全量测试里有 6 条会被这条 RPC 打成失败（2026-11-14）。
   - `packages/tui/src/feature-plugins/sidebar/quota.tsx`（**新文件**）+ `packages/tui/src/plugin/builtins.ts`（注册 `SidebarQuota`）—— 侧栏那块 `▼ Quota` 额度面板。**为什么不装现成的 opencode 插件**（`@slkiser/opencode-quota`）：插件的取数半边在 opencode 自己的 server 进程里，垫片换掉了那个 server 又不跑 JS，装上去不会动（见 [pitfalls.md](pitfalls.md)）。取数走 `context.client.rpc.call({rpcID:"antex.quota", method:"panel", input:{sessionID}})`——生成式 client 里**唯一**「任意 id + 任意方法」的通路，所以这道补丁不用动生成代码，也不必自造 `/api/quota`；失败只 `console.warn`，旧数据留在屏上。刷新是 60 秒定时 + 每个 `session.step.ended`。
   - `packages/tui/src/feature-plugins/sidebar/footer.tsx` —— 侧栏那张 `Getting started / Connect provider` 卡片不再渲染：它读 `/api/integration`（垫片空），点「Connect provider」进的是空对话框，纯死路（同文件里那个工作目录行是好的，留着）
+  - `packages/tui/src/util/renderer.ts` —— 设置窗口标题前先**把控制字符换成空格**，并把原生异常吞掉。OpenTUI 0.8 的 `ot_session_control` 只收可打印文本，C0/DEL/C1 一律 `InvalidArgument`；标题又来自会话首条消息（含换行），这个异常从 Solid effect 冒出来会把整个 TUI 带走（2026-11-14：粘一段多行内容就崩，见 [pitfalls.md](pitfalls.md)）。垫片侧的 `clean_title()` 同步拍平标题，见 [implementation.md](implementation.md)。
 - 编出来的客户端装在 `~/.local/bin/antex-tui`，**`antex` 默认就用它**（源码模式启动不慢，且底部没有 dev 模式的 `✓ Server ○ UI…` 那行）。
 - **上游更新后**（`git subtree pull`）跑一次 `script/build-tui.sh` 即可；两步合一就是下面那条 `./script/upgrade-upstream.sh`。
 - 想临时切回官方二进制：`ANTEX_CLIENT=opencode2 antex`。
@@ -66,7 +68,7 @@ Ante 没有 VCS/diff、分享、PTY（**MCP 与 undo/redo 已于 2026-10-22 转�
 {
   "$schema": "https://opencode.ai/v2/cli.json",
   "diffs": { "wrap": "word" },
-  "session": { "sidebar": "auto", "scrollbar": false, "thinking": "hide", "image_preview": true },
+  "session": { "sidebar": "auto", "scrollbar": false, "thinking": "hide", "verbosity": "medium", "image_preview": true },
   "tabs": { "mode": "off" },
   "animations": true,
   "plugins": ["./herdr-opencode", "-opencode.diffs", "-opencode.plugins", "-opencode.btw"],
@@ -108,7 +110,7 @@ bun install                    # 首次，需代理
 bun run dev -- --server http://127.0.0.1:41999
 ```
 
-**依赖**：Bun（本机 `1.4.2`，mise 装的，`bun` 在 `~/.local/share/mise/shims`）。
+**依赖**：Bun（`1.4.4`，mise 装的，`bun` 在 `~/.local/share/mise/shims`；`mise.toml` 钉的就是这个版本）。
 
 **补丁只压一条缝**：改动集中在上游「TUI 调后端」的那层（`packages/client/`，生成式 HTTP client 所在），
 `packages/tui/` 的界面代码尽量不动。这样上游更新等于 rebase 一小块，冲突可控；
@@ -133,6 +135,18 @@ cd - && ./script/build-tui.sh
 
 跑起来看界面有没有坏——**垫片假装的是接口，上游改了接口既不会有合并冲突、也不会有类型检查**，
 只能靠「拿真客户端跑一遍」当场发现。这是本方案唯一的防漂移手段，别省。
+
+**2026-11-14 那次升级（2.2.5 → 2.3.0，opentui 0.8.0 → 0.8.4）的实测结论**：
+
+- 只有 2 处冲突：`client/solid/data.ts`（同上次那处——上游把 `local` 收窄成 outbox/admitted 并新增 `delivered` 清理；**保留我们的全量 `local` + `mergeHeldRows`，再在 batch 里接住 `delivered.forEach`**），`routes/session/index.tsx`（上游删了 `status={isBackgroundSubagent(...)}` 与整个函数，后台子代理成了默认；保留我们的 `<box>` + progress 行，只删 status）。
+- **上游 2.3.0 自己修了标题控制字符崩溃**：`util/renderer.ts` 的 `setTerminalTitle` 已把 C0/DEL/C1 压成空格；我们在这之上多留一层 `try/catch`（原生异常不该带走会话）。测试合并为「上游的真渲染器用例 + 我们的 swallowed throw 用例」。
+- **`verbosity` 默认从 `medium` 改成 `low`**（每串工具/思考折成一行 activity）；本机 `cli.json` 钉 `session.verbosity: "medium"` 保持原观感。
+- **模型选择器在 `connected()` 恒假时的列表变了**：2.3.0 新增 `if (!connected()) return prioritizeFavorites(...)`，Favorites/Recent 分组标题消失、变成扁平优先排序；供应商名仍由我们的补丁强制显示。
+- **接口漂移依然很小**：新增 durable 事件 `session.step.first-token`（垫片不发 ⇒ 只是不显示 ttft）与 `/api/experimental/job`（只有 `opencode run` 用，TUI 不碰）。生成式 client 的类型变更全是加字段。
+- **`script/build-tui.sh` 的 Linux 产物路径修了**：`uname -m` 是 `x86_64`，上游目录叫 `cli-linux-x64`，原来会「编完找不到产物」；改按 `x86_64→x64`、`aarch64→arm64` 映射。
+- **测试结果（2026-11-14 全量）**：client **263/263**、Rust **86/86**；TUI 1662 通过 / 2 skip / **13 失败**。13 条里 5 条在干净的 2.3.0 基线上也失败（上游自身：resync 对话框 ×2、footer metrics、reconnect、art），8 条是 `/terminal`、`/fork` 相关用例——这两个命令被本仓的黑名单故意摘掉，属**预期失败**，别为它改上游测试。
+- **`evicts a whole family`（client）**：上游测试要求 `agent-switched` 行不跨重读；`data.ts` 现在把该类型排除在保留集之外，idle/compaction/流式中行照旧保留。
+- **验收**：TUI 标题 5 项、Rust 86 项全过；PTY 探针确认首页版本行、模型选择器供应商名、会话转录重建与 `/undo`、多行标题不崩、`Pending...` 角标、四家额度面板（2026-11-14 实测）。
 
 **2026-11-02 那次升级（2.0.29 → 2.2.5，opentui 0.5.17 → 0.8.0）的实测结论**，下次照着看：
 

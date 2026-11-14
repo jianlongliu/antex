@@ -1930,7 +1930,13 @@ export function createData(config: CreateDataInput) {
                 item.type === "user" || item.type === "synthetic" ? [item.id] : [],
               ),
             )
-            const local = (store.session.message[sessionID] ?? []).filter((item) => !ids.has(item.id))
+            // Upstream's eviction test pins the `agent-switched` marker as not surviving a
+            // transcript read: it is a notice folded from `session.agent.selected`, not a
+            // message the shim replays. The rows we must keep are the ones Ante's log has
+            // no equivalent for — idle markers, compactions, the step still streaming.
+            const local = (store.session.message[sessionID] ?? []).filter(
+              (item) => !ids.has(item.id) && item.type !== "agent-switched",
+            )
             const messages = local.length === 0 ? fetched : mergeHeldRows(fetched, local)
             // The transcript only holds delivered input, so a pending row it contains missed its
             // inbox.delivered event (and maybe its enqueued echo) while the event stream was down.

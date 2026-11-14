@@ -62,7 +62,7 @@ bun run script/build.ts --single --skip-web-ui
 # 产物目录名跟着平台走（上游 2.2.x 起是 `cli-<os>-<arch>`），以前这里把
 # `cli-linux-x64` 写死了：在 arm64 Mac 上编出来的是 `cli-darwin-arm64`，
 # 软链就指向一个不存在的路径，`antex` 一启动就 "No such file or directory"。
-built="$repo/vendor/opencode/packages/cli/dist/cli-$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)/bin/opencode"
+built="$repo/vendor/opencode/packages/cli/dist/cli-$(uname -s | tr 'A-Z' 'a-z')-$(case "$(uname -m)" in x86_64) echo x64 ;; aarch64) echo arm64 ;; *) uname -m ;; esac)/bin/opencode"
 if [ ! -x "$built" ]; then
   echo "构建产物没找到：$built" >&2
   echo "dist 里实际有：" >&2

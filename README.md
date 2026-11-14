@@ -16,7 +16,7 @@ Interface, theme and keybindings come from OpenTUI; every byte of data comes fro
 
 ![antex home screen](docs/home.png)
 
-<sub>Verified 2026-11-02 · opencode 2.2.5 (opentui 0.8.0) · Rust 1.99.1</sub>
+<sub>Verified 2026-11-14 · opencode 2.3.0 (opentui 0.8.4) · Rust 1.99.1</sub>
 
 </div>
 
@@ -403,7 +403,7 @@ default. The build output lands in `vendor/opencode/packages/cli/dist/cli-<os>-<
 The client source lives in `vendor/opencode/` as a git subtree:
 
 ```sh
-./script/upgrade-upstream.sh v2.2.5    # subtree pull + bun install + rebuild
+./script/upgrade-upstream.sh v2.3.0    # subtree pull + bun install + rebuild
 ```
 
 Omit the argument to track upstream's default branch (`dev`). After a subtree pull, re-check the client
@@ -440,7 +440,7 @@ install -m 755 target/release/antex ~/.local/bin/antex
 客户端源码以 git subtree 放在 `vendor/opencode/`：
 
 ```sh
-./script/upgrade-upstream.sh v2.2.5    # 拉子树 + bun install + 重建
+./script/upgrade-upstream.sh v2.3.0    # 拉子树 + bun install + 重建
 ```
 
 不给参数就跟上游默认分支（`dev`）。拉完要复核一遍客户端补丁——清单在
