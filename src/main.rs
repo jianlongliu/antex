@@ -2788,8 +2788,14 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     // A title Ante already has — one set from its own front end, or
                     // by a rename this shim asked for — is what the picker should
                     // read back, so keep the shim's copy in step with it.
-                    if let Some(title) = info.title.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
-                        write_title(&archive, Some(title));
+                    if let Some(title) = info
+                        .title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(clean_title)
+                    {
+                        write_title(&archive, Some(title.as_str()));
                     }
                 }
             }
@@ -2835,8 +2841,14 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                         store.resolve_effort(&client, provider, &model, &effort);
                     }
                 }
-                if let Some(title) = info.title.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
-                    write_title(&archive, Some(title));
+                if let Some(title) = info
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(clean_title)
+                {
+                    write_title(&archive, Some(title.as_str()));
                     let client = store
                         .ante
                         .active
@@ -4307,7 +4319,7 @@ fn title_file(dir: &str) -> std::path::PathBuf {
 fn title_override(dir: &str) -> Option<String> {
     let text = std::fs::read_to_string(title_file(dir)).ok()?;
     let text = text.trim();
-    (!text.is_empty()).then(|| short(&text.replace(['\n', '\r'], " "), 60))
+    (!text.is_empty()).then(|| clean_title(text))
 }
 
 /// Set the title, or (`None`) drop the override so the derived one shows again.
@@ -4343,9 +4355,25 @@ fn derived_title(dir: &str) -> String {
     if let Some(title) = session_meta(dir)
         .and_then(|meta| meta.get("first_user_message").and_then(|v| v.as_str()).map(str::to_string))
     {
-        return short(&title.replace(['\n', '\r'], " "), 60);
+        return clean_title(&title);
     }
     log_title(dir).unwrap_or_else(|| "untitled".into())
+}
+
+/// A title fit for a terminal: one line, no control characters, at most 60 chars.
+///
+/// Titles reach the client as OSC window titles. OpenTUI's native control
+/// rejects C0/DEL/C1 with `InvalidArgument`, and a throw from the title effect
+/// used to kill the session — while Ante's own title can be a slice of the first
+/// prompt, newlines included. Flatten them before anything stores or publishes it.
+fn clean_title(text: &str) -> String {
+    short(
+        &text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>(),
+        60,
+    )
 }
 
 /// When a session started and what was first asked, read off its event log.
@@ -6376,6 +6404,20 @@ async fn fallback() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_titles_carry_no_control_characters() {
+        // 2026-11-14: Ante titled a session with the first prompt and the client
+        // died setting the window title — OpenTUI's native control rejects C0/DEL/C1
+        // with InvalidArgument. Titles are OSC strings, so nothing control-shaped
+        // may reach the store or the wire.
+        assert_eq!(
+            clean_title("#工作报告\n\n天河\t私厨"),
+            "#工作报告  天河 私厨"
+        );
+        assert_eq!(clean_title("a\u{7f}b\u{85}c"), "a b c");
+        assert!(clean_title(&"字".repeat(80)).chars().count() <= 60);
+    }
 
     #[test]
     fn a_transcript_pages_back_to_its_beginning_without_losing_or_repeating_a_row() {

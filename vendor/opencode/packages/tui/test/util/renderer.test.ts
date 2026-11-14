@@ -24,6 +24,39 @@ test("clears the terminal title before destroying the renderer", () => {
   expect(calls).toEqual(["title:", "destroy"])
 })
 
+test("flattens control characters the native title control rejects", () => {
+  // 2026-11-14: Ante titled a session with the first prompt, newlines included.
+  // OpenTUI's native control validated the text, threw InvalidArgument from the
+  // title effect, and the session died before the first reply landed.
+  const calls: string[] = []
+  setTerminalTitle(
+    {
+      isDestroyed: false,
+      controlState: RendererControlState.IDLE,
+      setTerminalTitle(title) {
+        calls.push(title)
+      },
+    },
+    "OC | #工作报告\n\n天河\t私厨",
+  )
+  expect(calls).toEqual(["OC | #工作报告 天河 私厨"])
+})
+
+test("survives a title the native control still refuses", () => {
+  expect(() =>
+    setTerminalTitle(
+      {
+        isDestroyed: false,
+        controlState: RendererControlState.IDLE,
+        setTerminalTitle() {
+          throw new Error("ot_session_control failed: InvalidArgument")
+        },
+      },
+      "OpenCode",
+    ),
+  ).not.toThrow()
+})
+
 test("skips the title from suspend until resume completes and destroys a suspended renderer", async () => {
   await using setup = await createTestRenderer({ width: 10, height: 2 })
   await setup.renderer.setupTerminal()
