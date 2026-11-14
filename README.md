@@ -467,7 +467,7 @@ install -m 755 target/release/antex ~/.local/bin/antex
 | serde | 1.0.229 | derive |
 | serde_json | 1.0.151 | envelopes and event payloads |
 | futures | 0.3.34 | stream plumbing |
-| ante-sdk | 0.3.0 | the `Op`/`Evt` protocol; follows Ante's version series |
+| ante-sdk | 0.3.5 | the `Op`/`Evt` protocol; follows Ante's version series |
 | reqwest | 0.12.28 | OAuth round-trips, quota fetching (rustls) |
 | image | 0.25.10 | image compression |
 | base64 | 0.22.1 | inline `data:` URLs |
@@ -501,7 +501,7 @@ install -m 755 target/release/antex ~/.local/bin/antex
 | serde | 1.0.229 | 派生 |
 | serde_json | 1.0.151 | 信封与事件载荷 |
 | futures | 0.3.34 | 流拼接 |
-| ante-sdk | 0.3.0 | 连 Ante（`Op`/`Evt` 协议），跟着 Ante 的版本系列走 |
+| ante-sdk | 0.3.5 | 连 Ante（`Op`/`Evt` 协议），跟着 Ante 的版本系列走 |
 | reqwest | 0.12.28 | OAuth 往返、额度取数（rustls） |
 | image | 0.25.10 | 贴图压缩 |
 | base64 | 0.22.1 | 内联 `data:` URL 收发 |
@@ -651,7 +651,7 @@ Ante 底层没这个概念，写多少垫片代码也变不出来。这些是从
 **The UI is up but messages go nowhere.**
 Check `/tmp/antex.log` (`$TMPDIR/antex.log` on macOS). The startup self-check line states whether `ante`
 was found and whether the version series matches, e.g.
-`自检：… → ante 0.3.1；antex 编译于 ante-sdk 0.3.0，同一版本系列`. Runtime failures — not connected,
+`自检：… → ante 0.3.5；antex 编译于 ante-sdk 0.3.5，同一版本系列`. Runtime failures — not connected,
 event stream ended, message dropped — are written there too; nothing fails silently.
 
 **The model list takes a few seconds.**
@@ -694,7 +694,7 @@ opentui 0.8.0 and 0.8.1 share identical code here.
 
 **界面在跑，发消息却没反应？**
 先看 `/tmp/antex.log`（macOS 是 `$TMPDIR/antex.log`）。启动自检那行会明说 `ante` 找没找到、版本是否同一系列，例如
-`自检：… → ante 0.3.1；antex 编译于 ante-sdk 0.3.0，同一版本系列`。运行期的「未连接 / 事件流结束 / 消息被丢弃」也写同一处，不会静默。
+`自检：… → ante 0.3.5；antex 编译于 ante-sdk 0.3.5，同一版本系列`。运行期的「未连接 / 事件流结束 / 消息被丢弃」也写同一处，不会静默。
 
 **启动后模型列表要等几秒？**
 垫片每个请求都 spawn 一个 `ante catalog`（不缓存），TUI 起来时会并发拉三个。而 `ante catalog` 进程退出前要刷

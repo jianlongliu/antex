@@ -403,7 +403,8 @@ struct Ante {
     /// opencode's revert names it with a *message id*, and the two share no
     /// structure, so the id the client sends has to be translated here. Order
     /// matters: a successful rewind truncates this list at the boundary, the way
-    /// Ante truncates its own log.
+    /// Ante drops the turn from the conversation. Ante 0.3.5 keeps the old log
+    /// lines and appends `SessionRewound`, so the replay applies it too.
     turns: Arc<Mutex<HashMap<String, Vec<(String, String)>>>>,
     /// `op id → the client's message id` for prompts just handed to Ante, waiting
     /// to be claimed by the `TurnStart` that op starts. That event's id *is* the
@@ -2327,7 +2328,17 @@ async fn attach_session(
                 inbox: inbox.to_string(),
                 armed: std::time::Instant::now(),
             });
-            let op = Op::ResumeSession { session_id, unattended: false };
+            let op = Op::ResumeSession {
+                session_id,
+                unattended: false,
+                // The snapshot pins the tool set, so no filters are needed; the
+                // permission mode is not always pinned, and 0.3.5 accepts it here.
+                tools: None,
+                include_tools: None,
+                exclude_tools: None,
+                credential: None,
+                permission_mode: Some(mode),
+            };
             if let Err(err) = ops.send(ante_sdk::protocol::op_msg(op)).await {
                 log_line(&format!("ante: 恢复会话 {id} 发送失败：{err}"));
             }
@@ -3329,8 +3340,9 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     let _ = wait.send(Err(message));
                 }
             }
-            // The conversation was rewound: Ante truncated its own log, so the
-            // prompts after the boundary are gone. Drop them from the mapping and
+            // The conversation was rewound: Ante keeps the old log lines and
+            // appends `SessionRewound` (0.3.5+), so the prompts after the boundary
+            // are gone from the conversation. Drop them from the mapping and
             // tell the client, whose handler splices every row at or after `to`
             // and clears the staged revert.
             Evt::SessionRewound { to } => {
@@ -4405,24 +4417,38 @@ fn events_head(id: &str) -> Option<(i64, String)> {
 /// The title the *log* implies: the first thing the user asked.
 fn log_title(id: &str) -> Option<String> {
     let raw = std::fs::read_to_string(ante_home().join("sessions").join(id).join("events.jsonl")).ok()?;
+    // (turn id, text), in log order. A rewind removes the input that started the
+    // turn it names and every input after it — Ante 0.3.5 appends the rewind
+    // record instead of rewriting the log, so the first prompt in the file may be
+    // one the user already undid.
+    let mut inputs: Vec<(Option<String>, String)> = Vec::new();
     for line in raw.lines() {
         let Ok(wrapper) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let Some(text) = wrapper
-            .get("event")
-            .and_then(|event| event.get("UserInput"))
-            .and_then(|v| v.as_str())
-        else {
+        let Some(event) = wrapper.get("event") else {
             continue;
         };
-        // The log keeps the staged mentions and Ante's expansion of them; a title
-        // is the message, not the paths.
-        let (shown, _) = attachments::from_log(text);
-        let shown = if shown.trim().is_empty() { text.to_string() } else { shown };
-        return Some(short(&shown.replace(['\n', '\r'], " "), 60));
+        if let Some(text) = event.get("UserInput").and_then(|v| v.as_str()) {
+            inputs.push((
+                wrapper.get("parent").and_then(|v| v.as_str()).map(str::to_string),
+                text.to_string(),
+            ));
+            continue;
+        }
+        let Some(to) = event.get("SessionRewound").and_then(|v| v.get("to")).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(index) = inputs.iter().position(|(parent, _)| parent.as_deref() == Some(to)) {
+            inputs.truncate(index);
+        }
     }
-    None
+    let (_, text) = inputs.first()?;
+    // The log keeps the staged mentions and Ante's expansion of them; a title is
+    // the message, not the paths.
+    let (shown, _) = attachments::from_log(text);
+    let shown = if shown.trim().is_empty() { text.clone() } else { shown };
+    Some(short(&shown.replace(['\n', '\r'], " "), 60))
 }
 
 /// Whether Ante has this session on disk. `meta.json` is the stricter test and
@@ -4870,6 +4896,13 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
     // Tool parts by call id, so `ToolEnd` can close the part `ToolStart` opened.
     let mut calls: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Ante 0.3.5 appends a `SessionRewound` record instead of rewriting the log,
+    // so a replay has to apply it: the turn it names and everything after it are
+    // no longer part of the conversation. A turn is named by the op that started
+    // it, which is the `parent` of the prompt it answered.
+    let mut user_of_turn: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut first_of_turn: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut last_user: Option<usize> = None;
 
     for line in raw.lines() {
         let Ok(wrapper) = serde_json::from_str::<Value>(line) else {
@@ -4878,6 +4911,9 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
         let Some(event) = wrapper.get("event") else {
             continue;
         };
+        // A turn id is the op that submitted the prompt, and the `UserInput` line
+        // carries that op as its parent. Keep it before the typed parse below.
+        let parent = wrapper.get("parent").and_then(|value| value.as_str()).map(str::to_string);
         let Ok(event) = serde_json::from_value::<Evt>(event.clone()) else {
             continue;
         };
@@ -5011,9 +5047,21 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                     "skills": [],
                     "time": { "created": created },
                 }));
+                let index = messages.len() - 1;
+                if let Some(parent) = parent {
+                    user_of_turn.insert(parent, index);
+                }
+                last_user = Some(index);
             }
             Evt::TurnStart { turn_id } => {
                 turn = turn_id.to_string();
+                if !user_of_turn.contains_key(&turn)
+                    && let Some(index) = last_user
+                {
+                    user_of_turn.insert(turn.clone(), index);
+                }
+                first_of_turn.insert(turn.clone(), messages.len());
+                last_user = None;
                 steps = 0;
                 step = None;
                 open_tools = 0;
@@ -5204,6 +5252,30 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                         // the mark.
                         "time": { "created": created, "streamed": created, "completed": created },
                     }));
+                }
+            }
+            // Ante 0.3.5 keeps the old lines and appends this record; drop the
+            // turn it names (and everything after it) so a re-read does not bring
+            // back a prompt the user already undid. The client's own revert
+            // splices at or after the boundary, so the boundary prompt goes too.
+            Evt::SessionRewound { to } => {
+                let boundary = to.to_string();
+                let index = user_of_turn
+                    .get(&boundary)
+                    .copied()
+                    .or_else(|| first_of_turn.get(&boundary).copied());
+                if let Some(index) = index {
+                    messages.truncate(index);
+                    user_of_turn.retain(|_, at| *at < index);
+                    first_of_turn.retain(|_, at| *at < index);
+                    step = None;
+                    open_tools = 0;
+                    pending_usage = None;
+                    calls.clear();
+                    steps = 0;
+                    turn.clear();
+                    anchor = 0;
+                    last_user = None;
                 }
             }
             _ => {}
@@ -6405,6 +6477,10 @@ async fn fallback() -> Response {
 mod tests {
     use super::*;
 
+    // `ANTE_HOME` is process-global; tests that point it at a temporary home take
+    // this lock so they cannot see each other's directory.
+    static ANTE_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn session_titles_carry_no_control_characters() {
         // 2026-11-14: Ante titled a session with the first prompt and the client
@@ -7531,6 +7607,7 @@ mod tests {
         });
         std::fs::write(&log, format!("{line}\n")).expect("write log");
 
+        let _guard = ANTE_HOME_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var_os("ANTE_HOME");
         // SAFETY: this test owns the variable for its duration; the suite runs on
         // one thread per test and nothing else reads ANTE_HOME concurrently here.
@@ -7546,6 +7623,48 @@ mod tests {
         assert_eq!(rows[0]["command"], json!("echo hi"));
         assert_eq!(rows[0]["output"]["output"], json!("hi\n"));
         assert!(rows[0]["shellID"].as_str().is_some_and(|id| id.starts_with("sh_")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ante 0.3.5 appends `SessionRewound` instead of rewriting the log; the
+    /// replay must drop the turn it names or reopening a session shows the prompt
+    /// and answer the user already undid.
+    #[test]
+    fn a_rewind_record_drops_the_turn_it_names() {
+        let dir = std::env::temp_dir().join(format!("antex-rewind-replay-{}", std::process::id()));
+        let archive = "ses_rewind_replay";
+        let sessions = dir.join("sessions").join(archive);
+        std::fs::create_dir_all(&sessions).expect("temp session dir");
+        let log = sessions.join("events.jsonl");
+        let events = [
+            json!({"timestamp":"2026-11-14T00:00:00Z","id":"evt_1","parent":"op_01M7CG9JY9B231801RPGFAN1CA","event":{"UserInput":"first"}}),
+            json!({"timestamp":"2026-11-14T00:00:01Z","id":"evt_2","parent":"op_01M7CG9JY9B231801RPGFAN1CA","event":{"TurnStart":{"turn_id":"op_01M7CG9JY9B231801RPGFAN1CA"}}}),
+            json!({"timestamp":"2026-11-14T00:00:02Z","id":"evt_3","parent":"op_01M7CG9JY9B231801RPGFAN1CA","event":{"AgentMessage":"one"}}),
+            json!({"timestamp":"2026-11-14T00:00:03Z","id":"evt_4","parent":"op_01M7CG9JY9B231801RPGFAN1CA","event":{"TurnEnd":{"turn_id":"op_01M7CG9JY9B231801RPGFAN1CA","status":"Completed","steps":1}}}),
+            json!({"timestamp":"2026-11-14T00:00:04Z","id":"evt_5","parent":"op_01M7CG9JY9B231801RPGFAN1CB","event":{"UserInput":"second"}}),
+            json!({"timestamp":"2026-11-14T00:00:05Z","id":"evt_6","parent":"op_01M7CG9JY9B231801RPGFAN1CB","event":{"TurnStart":{"turn_id":"op_01M7CG9JY9B231801RPGFAN1CB"}}}),
+            json!({"timestamp":"2026-11-14T00:00:06Z","id":"evt_7","parent":"op_01M7CG9JY9B231801RPGFAN1CB","event":{"AgentMessage":"two"}}),
+            json!({"timestamp":"2026-11-14T00:00:07Z","id":"evt_8","parent":"op_01M7CG9JY9B231801RPGFAN1CB","event":{"TurnEnd":{"turn_id":"op_01M7CG9JY9B231801RPGFAN1CB","status":"Completed","steps":1}}}),
+            json!({"timestamp":"2026-11-14T00:00:08Z","id":"evt_9","parent":"op_01M7CG9JY9B231801RPGFAN1CC","event":{"SessionRewound":{"to":"op_01M7CG9JY9B231801RPGFAN1CB"}}}),
+        ];
+        let body = events.iter().map(|event| format!("{event}\n")).collect::<String>();
+        std::fs::write(&log, body).expect("write log");
+
+        let _guard = ANTE_HOME_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("ANTE_HOME");
+        // SAFETY: the lock above serialises the tests that change this variable.
+        unsafe { std::env::set_var("ANTE_HOME", &dir) };
+        let rows = replay_session(archive, &[]);
+        let title = log_title(archive);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ANTE_HOME", value) },
+            None => unsafe { std::env::remove_var("ANTE_HOME") },
+        }
+
+        assert_eq!(rows.len(), 2, "the rewound turn and everything after it are gone");
+        assert_eq!(rows[0]["text"], json!("first"));
+        assert_eq!(rows[1]["content"][0]["text"], json!("one"));
+        assert_eq!(title.as_deref(), Some("first"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

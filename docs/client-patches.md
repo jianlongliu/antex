@@ -144,6 +144,7 @@ cd - && ./script/build-tui.sh
 - **模型选择器在 `connected()` 恒假时的列表变了**：2.3.0 新增 `if (!connected()) return prioritizeFavorites(...)`，Favorites/Recent 分组标题消失、变成扁平优先排序；供应商名仍由我们的补丁强制显示。
 - **接口漂移依然很小**：新增 durable 事件 `session.step.first-token`（垫片不发 ⇒ 只是不显示 ttft）与 `/api/experimental/job`（只有 `opencode run` 用，TUI 不碰）。生成式 client 的类型变更全是加字段。
 - **`script/build-tui.sh` 的 Linux 产物路径修了**：`uname -m` 是 `x86_64`，上游目录叫 `cli-linux-x64`，原来会「编完找不到产物」；改按 `x86_64→x64`、`aarch64→arm64` 映射。
+- **ante-sdk 0.3.0 → 0.3.5**：协议只加可选字段；`Op::ResumeSession` 补上 `tools/include_tools/exclude_tools/credential/permission_mode`（恢复时带 `permission_mode`），`SessionRequest` 的 `..Default::default()` 自动接住 `credential`。0.3.5 的 rewind 改成追加 `SessionRewound`，`replay_session`/`log_title` 已按边界截断。
 - **测试结果（2026-11-14 全量）**：client **263/263**、Rust **86/86**；TUI 1662 通过 / 2 skip / **13 失败**。13 条里 5 条在干净的 2.3.0 基线上也失败（上游自身：resync 对话框 ×2、footer metrics、reconnect、art），8 条是 `/terminal`、`/fork` 相关用例——这两个命令被本仓的黑名单故意摘掉，属**预期失败**，别为它改上游测试。
 - **`evicts a whole family`（client）**：上游测试要求 `agent-switched` 行不跨重读；`data.ts` 现在把该类型排除在保留集之外，idle/compaction/流式中行照旧保留。
 - **验收**：TUI 标题 5 项、Rust 86 项全过；PTY 探针确认首页版本行、模型选择器供应商名、会话转录重建与 `/undo`、多行标题不崩、`Pending...` 角标、四家额度面板（2026-11-14 实测）。

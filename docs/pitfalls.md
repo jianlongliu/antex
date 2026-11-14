@@ -60,6 +60,7 @@ session.step.started → session.text.started → session.text.delta ×N → ses
 | 手写的 `auth/<preset>.json` 一会儿就被 Ante 删了 | Ante 用它**预设里写死的** issuer 续签（文件里的 `token_issuer` 不参与，实测 `/tmp` 里塞假 issuer 也没人搭理），401 即 `deleting <preset> oauth credential: refresh token rejected by issuer`。**这也意味着：写进去的必须是真令牌**，编不出来 |
 | 想看清 Ante 自己怎么写凭证 | 驱动它的登录即可，不必真账号：`ANTIX_API_URL=http://127.0.0.1:<假服务器>` + `ante auth login antix --no-browser --callback-port <口>`，授权 URL、令牌请求体、落盘文件名都看得见（2026-10-14 就是这么定下 `auth/<preset>.json` 那八个字段的） |
 | 粘一段多行内容，整个会话崩成一屏 `ot_session_control failed: InvalidArgument` | OpenTUI 0.8 的原生标题控制**只收可打印文本**（C0/DEL/C1 一律 `InvalidArgument`），而会话标题取自首条消息、本来就带换行；客户端的 `setTerminalTitle` 在 Solid effect 里调用，异常一抛就把整个 TUI 带走。**已修（2026-11-14）**：客户端先把控制字符换成空格、再吞掉原生异常；垫片 `clean_title()` 在存/发标题之前就拍平。**验法**：`bun test test/util/renderer.test.ts`；或在真渲染器里给标题塞 `\n`/`\t`，会话应照常活着（本地临时装 `@opentui/core@0.8.0` 复现过原报错） |
+| 撤销（rewind）后重开会话，已撤销的回合又出现 | Ante 0.3.5 把 rewind 记成追加的 `SessionRewound`，不再重写 `events.jsonl`；旧回放忽略该记录。**已修（2026-11-14）**：`replay_session` 按边界截断、`log_title` 跳过被撤销的首条。**验法**：`cargo test a_rewind_record_drops_the_turn_it_names`；或对一个真被撤销的会话 `curl /api/session/<id>/message`，应为空 |
 
 ## Herdr 集成（OSC 7501）
 
