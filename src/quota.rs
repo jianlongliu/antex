@@ -239,6 +239,7 @@ fn unusable(message: &str) -> bool {
     message.contains("HTTP 401")
         || message.contains("HTTP 403")
         || message.contains("no Go subscription")
+        || message.contains("no Command Code subscription")
         || message.contains("Entitlement")
 }
 
@@ -336,14 +337,27 @@ async fn commandcode(keys: &[&str]) -> Result<Quota, String> {
                 .sum::<f64>()
         })
         .unwrap_or(0.0);
-    // 月度窗口更常见的是「剩下的钱」而不是一个 cap：按订阅档位的额度换算成百分比。
+    // 订阅状态只在缺 M 窗口时问一次：有效档位能把「剩下的钱」换算成百分比，而过期、
+    // 取消或从未订阅（实测过期账户回 `data: null`）说明这家现在没有可显示的额度。
+    let mut no_subscription = false;
+    let mut subscription_error = None;
     if !rows.iter().any(|row| matches!(row, Row::Window { label, .. } if label == "M")) {
-        if let Some((percent, reset_ms)) = commandcode_month_window(&key, remaining).await {
-            rows.push(Row::Window {
-                label: "M".to_string(),
-                used_percent: percent,
+        match commandcode_subscription(&key).await {
+            Ok(Subscription::Active {
+                allowance: Some(allowance),
                 reset_ms,
-            });
+            }) => {
+                let used = (allowance - remaining).max(0.0);
+                rows.push(Row::Window {
+                    label: "M".to_string(),
+                    used_percent: (used / allowance * 100.0).clamp(0.0, 100.0),
+                    reset_ms,
+                });
+            }
+            // 档位不在表里时只能显示余额，别拿猜的 allowance 算百分比。
+            Ok(Subscription::Active { allowance: None, .. }) => {}
+            Ok(Subscription::Inactive) => no_subscription = true,
+            Err(message) => subscription_error = Some(message),
         }
     }
     if remaining > 0.0 {
@@ -353,7 +367,11 @@ async fn commandcode(keys: &[&str]) -> Result<Quota, String> {
         });
     }
     if rows.is_empty() {
-        return Err("the API returned no windows".to_string());
+        // 没订阅（到期、取消、从未订阅）和没凭据一样整块收起；只有真故障才留 Unavailable。
+        if no_subscription {
+            return Err("no Command Code subscription".to_string());
+        }
+        return Err(subscription_error.unwrap_or_else(|| "the API returned no windows".to_string()));
     }
     Ok(Quota {
         rows,
@@ -361,26 +379,46 @@ async fn commandcode(keys: &[&str]) -> Result<Quota, String> {
     })
 }
 
-/// 订阅表只用来把「月度余额」还原成百分比；拿不到就只显示余额。
-async fn commandcode_month_window(key: &str, remaining: f64) -> Option<(f64, Option<i64>)> {
-    let body = get_json("https://api.commandcode.ai/alpha/billing/subscriptions", key, &[]).await.ok()?;
-    let data = body.get("data")?;
+/// Command Code 订阅的结论：还有效，或者没有有效订阅（到期、取消、从未订阅）。
+enum Subscription {
+    Active {
+        /// 订阅档位对应的月度额度；档位不在 [`COMMANDCODE_ALLOWANCES`] 里时为 `None`。
+        allowance: Option<f64>,
+        reset_ms: Option<i64>,
+    },
+    Inactive,
+}
+
+async fn commandcode_subscription(key: &str) -> Result<Subscription, String> {
+    let body = get_json("https://api.commandcode.ai/alpha/billing/subscriptions", key, &[]).await?;
+    Ok(subscription_state(&body))
+}
+
+/// 订阅接口的响应 → [`Subscription`]。
+fn subscription_state(body: &Value) -> Subscription {
+    // `{"success":true,"data":null}` 是过期账户的实测形状（2026-11-18）。
+    let Some(data) = body.get("data").filter(|data| !data.is_null()) else {
+        return Subscription::Inactive;
+    };
     let status = data.get("status").and_then(Value::as_str).unwrap_or("");
     if !matches!(status, "active" | "trialing") {
-        return None;
+        return Subscription::Inactive;
     }
-    let plan = data.get("planId").and_then(Value::as_str)?.to_lowercase();
-    let allowance = COMMANDCODE_ALLOWANCES
-        .iter()
-        .find(|(id, _)| *id == plan)
-        .map(|(_, amount)| *amount)?;
-    let used = (allowance - remaining).max(0.0);
-    let reset = data
+    let allowance = data
+        .get("planId")
+        .and_then(Value::as_str)
+        .map(str::to_lowercase)
+        .and_then(|plan| {
+            COMMANDCODE_ALLOWANCES
+                .iter()
+                .find(|(id, _)| *id == plan)
+                .map(|(_, amount)| *amount)
+        });
+    let reset_ms = data
         .get("currentPeriodEnd")
         .and_then(Value::as_str)
-        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-        .map(|at| at.timestamp_millis());
-    Some(((used / allowance * 100.0).clamp(0.0, 100.0), reset))
+        .and_then(parse_rfc3339_ms);
+    Subscription::Active { allowance, reset_ms }
 }
 
 /// ChatGPT / Codex subscription limits, asked of Ante rather than fetched by us.
@@ -1069,5 +1107,43 @@ mod tests {
             assert!(!provider.id.is_empty());
             assert!(provider.header.starts_with('['), "{}", provider.header);
         }
+    }
+
+    /// Command Code 过期账户的订阅接口回 `data: null`（2026-11-18 实测）：
+    /// 这是「没有有效订阅」，不是取数故障。
+    #[test]
+    fn expired_commandcode_subscriptions_are_inactive() {
+        assert!(matches!(
+            subscription_state(&json!({"success": true, "data": null})),
+            Subscription::Inactive
+        ));
+        assert!(matches!(
+            subscription_state(&json!({"data": {"status": "canceled"}})),
+            Subscription::Inactive
+        ));
+        match subscription_state(&json!({
+            "data": {
+                "status": "active",
+                "planId": "individual-goat",
+                "currentPeriodEnd": "2026-12-01T00:00:00Z"
+            }
+        })) {
+            Subscription::Active {
+                allowance: Some(amount),
+                reset_ms: Some(_),
+            } => assert_eq!(amount, 70.0),
+            _ => panic!("expected an active priced subscription"),
+        }
+        assert!(matches!(
+            subscription_state(&json!({"data": {"status": "active", "planId": "mystery"}})),
+            Subscription::Active { allowance: None, .. }
+        ));
+    }
+
+    /// `Unavailable` 只留给真故障；「没有订阅」要和没凭据一样整块收起。
+    #[test]
+    fn a_missing_subscription_is_hidden_not_unavailable() {
+        assert!(unusable("no Command Code subscription"));
+        assert!(!unusable("the API returned no windows"));
     }
 }
