@@ -43,6 +43,10 @@ build() {
   cd vendor/opencode
   bun install --frozen-lockfile
   cd packages/cli
+  # 不给 OPENCODE_VERSION 时上游会拼 `0.0.0-makepkg-<时间戳>`（subtree 里没有
+  # git 分支可读），`antex-tui --version` 就会说谎；把 vendor 的 package.json
+  # 版本喂进去，跟 script/build-tui.sh 的做法一致。
+  export OPENCODE_VERSION="$(grep -m1 '"version"' ../../package.json | sed 's/.*"version": *"\([^"]*\)".*/\1/')"
   bun run script/build.ts --single --skip-web-ui
 }
 
