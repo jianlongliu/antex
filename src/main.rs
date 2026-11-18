@@ -6055,6 +6055,8 @@ USAGE
   antex                  Start the shim and hand the terminal to the TUI
                          (one command: the shim stops when the TUI exits)
   antex PORT             Same, on PORT (default 41999)
+  antex --prompt <text> [PORT]
+                         Same, with a first message the TUI submits once ready
   antex serve [PORT]     Start only the shim, stay in the foreground
   antex -h | --help      Show this help
   antex -v | --version   Show backend, client and shim versions
@@ -6064,7 +6066,7 @@ CONNECTING A CLIENT
 
 CLIENT SUBCOMMANDS STAY WITH THE CLIENT
   antex-tui --help       The client this shim hands the terminal to
-                         (upstream opencode v2 CLI). antex forwards nothing.
+                         (upstream opencode v2 CLI). antex forwards only --prompt.
   serve / service / upgrade / uninstall belong to stock opencode: they start
   its server and install its packages, not this shim.
 
@@ -6121,11 +6123,13 @@ struct Args {
     port: u16,
     /// `serve` 子命令：只起服务，不接管终端。
     serve_only: bool,
+    /// 交给客户端 TUI 的首条消息；模型就绪后自动提交。
+    prompt: Option<String>,
 }
 
 /// `Ok(Some(args))` 正常，`Ok(None)` 已打印帮助并应退出，`Err` 是用法错误。
 fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
-    let mut parsed = Args { port: 41999, serve_only: false };
+    let mut parsed = Args { port: 41999, serve_only: false, prompt: None };
     let mut rest = args.into_iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -6138,6 +6142,10 @@ fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "serve" => parsed.serve_only = true,
+            "--prompt" => {
+                let value = rest.next().ok_or("--prompt needs a prompt")?;
+                parsed.prompt = Some(value);
+            }
             "--port" => {
                 let value = rest.next().ok_or("--port needs a port number")?;
                 parsed.port = value.parse().map_err(|_| format!("not a port number: {value}"))?;
@@ -6147,6 +6155,9 @@ fn parse_args(args: Vec<String>) -> Result<Option<Args>, String> {
                 Err(_) => return Err(format!("unknown argument: {other}")),
             },
         }
+    }
+    if parsed.serve_only && parsed.prompt.is_some() {
+        return Err("--prompt starts the TUI prompt; it cannot be used with `serve`".into());
     }
     Ok(Some(parsed))
 }
@@ -6359,8 +6370,11 @@ async fn main() {
     let mut command = std::process::Command::new(&client);
     command
         .arg("--server")
-        .arg(format!("http://127.0.0.1:{port}"))
-        .arg(&directory);
+        .arg(format!("http://127.0.0.1:{port}"));
+    if let Some(prompt) = &args.prompt {
+        command.arg("--prompt").arg(prompt);
+    }
+    command.arg(&directory);
     // The client must not outlive us: an orphan TUI keeps the terminal in raw
     // mode, where even Ctrl+C produces no signal to get out with.
     terminal::die_with_parent(&mut command);
@@ -6480,6 +6494,34 @@ mod tests {
     // `ANTE_HOME` is process-global; tests that point it at a temporary home take
     // this lock so they cannot see each other's directory.
     static ANTE_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn prompt_reaches_the_client_and_defaults_to_none() {
+        let plain = parse_args(vec![]).unwrap().unwrap();
+        assert!(plain.prompt.is_none());
+
+        let prompted = parse_args(vec![
+            "--prompt".into(),
+            "diagnose the crash".into(),
+            "42000".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(prompted.port, 42000);
+        assert_eq!(prompted.prompt.as_deref(), Some("diagnose the crash"));
+    }
+
+    #[test]
+    fn prompt_needs_a_value_and_serve_rejects_it() {
+        assert!(matches!(
+            parse_args(vec!["--prompt".into()]),
+            Err(err) if err.contains("--prompt")
+        ));
+        assert!(matches!(
+            parse_args(vec!["serve".into(), "--prompt".into(), "x".into()]),
+            Err(err) if err.contains("serve")
+        ));
+    }
 
     #[test]
     fn session_titles_carry_no_control_characters() {

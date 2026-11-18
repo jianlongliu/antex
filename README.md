@@ -223,6 +223,7 @@ antex-tui --server http://127.0.0.1:41999     # terminal B: the client
 | Flag / variable | Meaning |
 | --- | --- |
 | `antex PORT` | Use `PORT` instead of the default `41999` |
+| `antex --prompt <text> [PORT]` | Start the TUI with a first prompt, submitted automatically once the model is ready |
 | `antex serve [PORT]` | Serve only; do not start the TUI |
 | `antex -v` / `--version` | Print shim, backend and client versions |
 | `antex -h` / `--help` | Usage |
@@ -258,6 +259,7 @@ antex-tui --server http://127.0.0.1:41999     # 终端 B：客户端
 | 参数 / 变量 | 含义 |
 | --- | --- |
 | `antex PORT` | 指定端口（默认 `41999`） |
+| `antex --prompt <文本> [PORT]` | 给 TUI 一条首条消息，模型就绪后自动提交 |
 | `antex serve [PORT]` | 只起服务，不进 TUI |
 | `antex -v` / `--version` | 打印垫片、后端、客户端三方版本 |
 | `antex -h` / `--help` | 用法 |
