@@ -252,6 +252,13 @@ Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yo
 - **README 重写**：中英双语，按标准章节（安装/使用/更新/移除/编译/依赖/完成/待做/遗弃/致谢），补了原本缺的移除与更新。标题改 `ANTEX = ANTE + OPENTUI`。
 - **Ante 0.3.2 起子代理有完整落盘**：`sessions/<父>/subagents/<suba_>/events.jsonl` 是整段对话，`ToolEnd.result_json` 也带 `session_id`/`report`/`tool_use_count`/耗时/用量。客户端那套「子代理 = child session」的 UI 仍要等上游推完整事件流，但「跑完看完整过程」已经有数据基础了。
 
+**`2026.11.20rc1`：Omarchy 切主题后 TUI 立即换色**
+
+- **症状**：切主题（Omarchy 同时换壁纸）后，助手回复的底色还是旧配色，关掉重开才正常。
+- **根因**：`theme.name=system` 时，颜色来自启动时探测的终端调色板。Omarchy 的 `omarchy-restart-opencode` 只给名为 `opencode` 的进程发 `SIGUSR2`；我们跑的是 `antex-tui`，信号打空。
+- **修法**：`antex` 启动时若检测到 `~/.local/share/omarchy`，就把 `script/omarchy/theme-set.d/90-antex-tui` 安装到 `~/.config/omarchy/hooks/theme-set.d/`（内容只有 `pkill -SIGUSR2 -x antex-tui`，权限 0755）。TUI 本来就有 `SIGUSR2` → 重新探测调色板的通路；安装失败只写日志，不影响客户端启动。
+- **验证**：`cargo test` 钉住「只装到 Omarchy」「信号打给 antex-tui」「第二次启动不重写」；装包后切主题，回复底色应立即变化，无需重启。
+
 **`2026.11.02rc2`：贴图修好（2.2.5 换了附件形状）**
 
 - **症状**：升级到 2.2.5 后粘贴图片**静默失效**——`files` 回来是空数组、模型说「没看到图片」、垫片日志一行都没有。

@@ -2107,6 +2107,44 @@ fn client_config_from_disk() -> Option<String> {
 /// 20 MB and says so in the log.
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
+/// Omarchy's `omarchy-restart-opencode` signals a process named `opencode`.
+/// Our client runs as `antex-tui`, so a theme switch would leave every explicit
+/// palette colour — the assistant's reply background among them — at the values
+/// probed when the TUI started. Omarchy runs `theme-set.d` hooks, and the TUI
+/// already turns `SIGUSR2` into a palette re-read, so drop a hook of our own.
+const OMARCHY_THEME_HOOK: &str = include_str!("../script/omarchy/theme-set.d/90-antex-tui");
+
+/// Returns whether the hook was written. Best-effort: a missing or read-only
+/// Omarchy config must not stop the client from starting.
+fn install_omarchy_theme_hook(home: &std::path::Path) -> std::io::Result<bool> {
+    if !home.join(".local/share/omarchy").is_dir() {
+        return Ok(false);
+    }
+    let dir = home.join(".config/omarchy/hooks/theme-set.d");
+    let path = dir.join("90-antex-tui");
+    let unchanged =
+        std::fs::read_to_string(&path).is_ok_and(|current| current == OMARCHY_THEME_HOOK);
+    if !unchanged {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&path, OMARCHY_THEME_HOOK)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(!unchanged)
+}
+
+fn install_omarchy_theme_hook_best_effort() {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    match install_omarchy_theme_hook(std::path::Path::new(&home)) {
+        Ok(true) => log_line("omarchy: 已安装主题切换刷新 hook（90-antex-tui）"),
+        Ok(false) => {}
+        Err(err) => log_line(&format!("omarchy: 主题切换 hook 装不上：{err}")),
+    }
+}
+
 /// Which opencode client to hand the terminal to. `~/.local/bin/antex-tui` is
 /// **our** build (vendored source + the Ante logo) and wins when present; the
 /// stock binary is the fallback.
@@ -6363,6 +6401,7 @@ async fn main() {
     }
     let directory =
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(default_directory()));
+    install_omarchy_theme_hook_best_effort();
     let client = client_executable();
     // Taken before the client runs: it is the client that switches the tty to
     // raw mode, and these are the modes worth putting back (see `terminal`).
@@ -7708,5 +7747,40 @@ mod tests {
         assert_eq!(rows[1]["content"][0]["text"], json!("one"));
         assert_eq!(title.as_deref(), Some("first"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Omarchy's own hook only signals `opencode`; ours has to reach the client
+    /// we actually launch. A second launch must not rewrite the hook every time.
+    #[cfg(unix)]
+    #[test]
+    fn the_omarchy_hook_signals_our_client_and_is_left_alone_afterwards() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::temp_dir().join(format!("antex-omarchy-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/share/omarchy")).unwrap();
+
+        assert!(install_omarchy_theme_hook(&home).unwrap());
+        let path = home.join(".config/omarchy/hooks/theme-set.d/90-antex-tui");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("pkill -SIGUSR2 -x antex-tui"));
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!install_omarchy_theme_hook(&home).unwrap());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A non-Omarchy machine must not get an Omarchy config tree just by
+    /// launching antex.
+    #[test]
+    fn the_omarchy_hook_is_not_installed_elsewhere() {
+        let home = std::env::temp_dir().join(format!("antex-no-omarchy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        assert!(!install_omarchy_theme_hook(&home).unwrap());
+        assert!(!home.join(".config/omarchy/hooks/theme-set.d/90-antex-tui").exists());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

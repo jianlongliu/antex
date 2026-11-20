@@ -1,0 +1,6 @@
+#!/bin/sh
+# Installed by antex. Omarchy's omarchy-restart-opencode only signals a process
+# named `opencode`; our client runs as `antex-tui`, so its theme palette would
+# otherwise stay at the values probed when it started. The TUI already handles
+# SIGUSR2 by re-reading the terminal palette and refreshing the active theme.
+pkill -SIGUSR2 -x antex-tui 2>/dev/null || true
