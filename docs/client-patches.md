@@ -149,6 +149,16 @@ cd - && ./script/build-tui.sh
 - **`evicts a whole family`（client）**：上游测试要求 `agent-switched` 行不跨重读；`data.ts` 现在把该类型排除在保留集之外，idle/compaction/流式中行照旧保留。
 - **验收**：TUI 标题 5 项、Rust 86 项全过；PTY 探针确认首页版本行、模型选择器供应商名、会话转录重建与 `/undo`、多行标题不崩、`Pending...` 角标、四家额度面板（2026-11-14 实测）。
 
+**2026-11-24 那次升级（2.3.0 → 2.4.1，opentui 0.8.4 → 0.9.4）的实测结论**：
+
+- 只有 1 处冲突：`routes/session/index.tsx`——上游在同一位置加了 `openingTab`，与我们的 `awaitingFirstChunk`（首 token 前的 Thinking 占位）并存，两边都留。
+- **OpenTUI 0.9.4**：`util/renderer.ts` 依赖的 `RendererControlState` 与 `setTerminalTitle` 签名没变，控制字符压平 + `try/catch` 原样保留；`bun run typecheck` 全绿（1930 个文件）。
+- 上游 2.4.0 的「新设计默认开、默认主题换成新版 `opencode`」不影响本机：`cli.json` 的 `theme.name: "system"` 仍是合法值，主题表里保留 `opencode-classic`；`session.verbosity`、`tabs.mode` 字段也还在。
+- 我们的 `home/footer.tsx` 补丁把版本行挪进 `BackendVersion` 后，`View` 里的 `visibility` 成了未使用变量（`TS6133`），已删。
+- **ante-sdk 0.3.5 → 0.3.9**：0.3.8 把 `Usage.cache_creation_tokens` 改名为 `cache_write_tokens`，协议结构体没有 serde 重命名，`meta.json` 的同名字段跟着变。`src/main.rs` 四处置换；`/stats` 折会话 meta 时新旧键都认（取较大值，两键互斥不会重复计）。`ModelSpec` 去掉 `top_p`/`top_k`、新增可选 `compact_at`，`SessionRequest.rollover` 与 `SessionInfo.rolled_from` 都是可选字段，本仓未引用。
+- **测试结果（2026-11-24 全量）**：Rust **93/93**、client **270/270**；TUI 1725 通过 / 2 skip / **12 失败**，失败名与上次记录的基线一致（resync 对话框 ×2、footer metrics、reconnect），外加本仓故意摘掉的 `/terminal`、`/fork` 用例；上次的 `art` 基线失败这次没有复现。
+- **PTY 探针（2026-11-24 实测）**：首页 logo 与 `ante 0.3.9 · antex 2026-11-24` 版本行、`/models` 的供应商名、`/connect` 的 Popular 排序（OpenAI Subscription 与 Antix 在前）、`/sh` 过滤后 share/fork/terminal/update 均不出现、一次真回合（回复渲染、额度面板、MCP 连接、token 统计）。`cli.json` 升级后没有被重写。
+
 **2026-11-02 那次升级（2.0.29 → 2.2.5，opentui 0.5.17 → 0.8.0）的实测结论**，下次照着看：
 
 - 4 个文件冲突（`builtins.ts`、`dialog-model.tsx`、`client/solid/data.ts`、`cli/package.json`），其余 7 处补丁自动重合。冲突的共同形态是**上游在同几行加了新能力**（`SidebarLimit`、`newDesigns()` 分支、重读保护），解的时候取上游新字段、只留我们那句判断。

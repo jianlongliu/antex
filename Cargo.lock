@@ -19,9 +19,9 @@ dependencies = [
 
 [[package]]
 name = "ante-protocol-shape"
-version = "0.3.5"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d785db3373e256ebe1b65b7155093d905c818379e7d6b34026eebe568eec08ce"
+checksum = "786a885e15d9be2cdad783d6406240d4b76b03608b5652393082709aa9b3c3c6"
 dependencies = [
  "chrono",
  "serde",
@@ -31,9 +31,9 @@ dependencies = [
 
 [[package]]
 name = "ante-sdk"
-version = "0.3.5"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4d97cbc11665f6f32d9a2f1f403c66a1c9689eff47d28c69585c898232fc443"
+checksum = "dba7b517716f8254f66f4b16f3893fd7181196c6624e1358af0f9262f90f1461"
 dependencies = [
  "ante-protocol-shape",
  "futures-util",
@@ -350,7 +350,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1041,7 +1041,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

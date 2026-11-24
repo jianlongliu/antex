@@ -108,7 +108,6 @@ function BackendVersion(props: { context: Plugin.Context }) {
 
 function View(props: { context: Plugin.Context }) {
   const dimensions = useTerminalDimensions()
-  const visibility = createMemo(() => homeFooterVisibility(dimensions().width))
 
   return (
     <Show when={dimensions().height >= 14 && dimensions().width >= 44}>

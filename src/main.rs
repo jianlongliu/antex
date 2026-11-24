@@ -3259,7 +3259,7 @@ async fn pump_events(store: &Store, mut rx: EventReceiver) -> String {
                     usage.input_tokens,
                     usage.output_tokens,
                     usage.cache_read_tokens.unwrap_or(0),
-                    usage.cache_creation_tokens.unwrap_or(0),
+                    usage.cache_write_tokens.unwrap_or(0),
                 ));
                 if step_open {
                     if step_tokens.is_none() {
@@ -5233,7 +5233,7 @@ fn replay_session(id: &str, handed: &[(String, String)]) -> Vec<Value> {
                     "input": usage.input_tokens,
                     "output": usage.output_tokens,
                     "reasoning": 0,
-                    "cache": { "read": usage.cache_read_tokens, "write": usage.cache_creation_tokens },
+                    "cache": { "read": usage.cache_read_tokens, "write": usage.cache_write_tokens },
                 });
                 // Ante reports a call between its content and the tools it asked
                 // for, so this is the step's own numbers when a step is open (a
@@ -5587,7 +5587,9 @@ fn stats_from_rows(rows: &[SessionRow], from: Option<i64>, to: i64) -> Value {
             field("input_tokens"),
             field("output_tokens"),
             field("cache_read_tokens"),
-            field("cache_creation_tokens"),
+            // Ante renamed this in 0.3.8; sessions written before that keep the
+            // old key, and both count toward the same total.
+            field("cache_write_tokens").max(field("cache_creation_tokens")),
         );
         input += cue;
         output += coutput;
@@ -6837,7 +6839,7 @@ mod tests {
                 input_tokens: input,
                 output_tokens: output,
                 cache_read_tokens: None,
-                cache_creation_tokens: None,
+                cache_write_tokens: None,
             },
             context: None,
         }
@@ -7208,7 +7210,7 @@ mod tests {
                 "model": "example-model",
                 "message_count": messages,
                 "usage": { "input_tokens": 10, "output_tokens": 4,
-                           "cache_read_tokens": 2, "cache_creation_tokens": 1 },
+                           "cache_read_tokens": 2, "cache_write_tokens": 1 },
             }),
         };
         let day = 86_400_000i64;
@@ -7234,6 +7236,15 @@ mod tests {
         assert_eq!(empty["sessions"], json!(0));
         assert_eq!(empty["range"]["from"], json!(day), "no sessions, so now");
         assert_eq!(empty["activity"], json!([]));
+
+        // Sessions written before Ante 0.3.8 spelled the cache-write key the old way.
+        let legacy = vec![SessionRow {
+            created: day * 12,
+            prompts: 0,
+            meta: json!({ "usage": { "cache_creation_tokens": 7 } }),
+        }];
+        let stats = stats_from_rows(&legacy, None, day * 13);
+        assert_eq!(stats["tokens"]["cache"]["write"], json!(7));
     }
 
     #[test]
