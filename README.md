@@ -28,6 +28,7 @@ Interface, theme and keybindings come from OpenTUI; every byte of data comes fro
 | --- | --- |
 | [What it is](#what-it-is) | [这是什么](#%E8%BF%99%E6%98%AF%E4%BB%80%E4%B9%88) |
 | [Features](#features) | [功能](#%E5%8A%9F%E8%83%BD) |
+| [Privacy and telemetry](#privacy-and-telemetry) | [隐私与遥测](#%E9%9A%90%E7%A7%81%E4%B8%8E%E9%81%A5%E6%B5%8B) |
 | [Requirements](#requirements) | [环境要求](#%E7%8E%AF%E5%A2%83%E8%A6%81%E6%B1%82) |
 | [Installation](#installation) | [安装](#%E5%AE%89%E8%A3%85) |
 | [Usage](#usage) | [使用](#%E4%BD%BF%E7%94%A8) |
@@ -101,6 +102,19 @@ Per-feature implementation notes and verification steps live in [`docs/implement
 | **Subagent progress** | While an `Agent` call runs, the block shows the last line the subagent said, fed by Ante's live `Evt::ToolUpdate`. The line stays after the call ends — a fast subagent emits it and its result in the same tick |
 | **No fake doors** | Concepts Ante lacks (LSP, VCS, terminals, subagent sessions) are removed from the UI rather than left as dead entries |
 
+## Privacy and telemetry
+
+**antex has telemetry disabled: it sends none of its own and forces OTLP export off in every Ante child.**
+
+Every Ante child the shim spawns — `ante serve --stdio`, `ante catalog`, `ante auth`, `ante usage`, and
+version probes — is started with `ANTE_TELEMETRY=off`, so an inherited `ANTE_TELEMETRY=on` cannot
+re-enable Ante's OTLP metrics or application logs. The shim sends no telemetry containing usage analytics,
+crash reports, or session content.
+
+The bundled opencode TUI has its own OTLP export, but only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set;
+antex never sets it. Running `ante` directly is outside the shim's control — set `ANTE_TELEMETRY=off`
+yourself. `ante rage` is a manual, redacted bug-report bundle, not automatic telemetry.
+
 ## 功能
 
 界面里看到的每一条都是真数据，不是模拟。逐条实现细节与验证法见 [`docs/implementation.md`](docs/implementation.md)。
@@ -126,6 +140,18 @@ Per-feature implementation notes and verification steps live in [`docs/implement
 | **MCP 服务器**（`/mcps`） | 配在 `~/.ante/settings.json` 的 `mcp_servers`，**第一个提示词之前列表是空的**，面板里**不能启停**——Ante 没有运行时开关 |
 | **子代理进度** | `Agent` 调用跑的时候，块里显示子代理说的最后一句，数据来自 Ante 的 `Evt::ToolUpdate`。**跑完那行也留着**——快子代理在同一 tick 里发完它和结果 |
 | **不装样子** | Ante 没有的概念（LSP、VCS、终端、子代理会话）从界面里摘掉，而不是留个点了没反应的入口 |
+
+## 隐私与遥测
+
+**antex 已禁止遥测：自身不发，且强制关闭所有 Ante 子进程的 OTLP 导出。**
+
+垫片 spawn 的每个 Ante 子进程——`ante serve --stdio`、`ante catalog`、`ante auth`、`ante usage` 和
+版本探测——都带 `ANTE_TELEMETRY=off`，所以调用环境里的 `ANTE_TELEMETRY=on` 不能把 Ante 的 OTLP
+metrics 或应用日志重新打开。垫片不向任何遥测端点发送使用统计、崩溃报告或会话内容。
+
+自编 opencode TUI 有自己的 OTLP 导出，但只在设了 `OTEL_EXPORTER_OTLP_ENDPOINT` 时启用；antex 从不设
+这个变量。直接运行 `ante` 不在垫片控制范围内——请自己设 `ANTE_TELEMETRY=off`。`ante rage` 是手动、
+脱敏的 bug 报告包，不是自动遥测。
 
 ---
 
@@ -657,9 +683,12 @@ was found and whether the version series matches, e.g.
 event stream ended, message dropped — are written there too; nothing fails silently.
 
 **The model list takes a few seconds.**
-The shim runs `ante catalog` per request (uncached), and the TUI fires three of them at startup. `ante
-catalog` waits on its OpenTelemetry export before exiting, so a slow network costs those seconds
-(`ante --version`, same binary, returns in milliseconds). Disable telemetry to make it disappear:
+The shim runs `ante catalog` per request (uncached), and the TUI fires three of them at startup.
+`antex` sets `ANTE_TELEMETRY=off` on every Ante child, so no OTLP export waits on the network; in Ante
+0.3.9 `ante catalog` skips telemetry export anyway. If the delay persists, check `/tmp/antex.log` and
+the startup self-check line.
+
+If you run Ante directly, disable its telemetry yourself:
 
 ```sh
 export ANTE_TELEMETRY=off      # off / false / 0 / disable / disabled, case-insensitive
@@ -699,8 +728,11 @@ opentui 0.8.0 and 0.8.1 share identical code here.
 `自检：… → ante 0.3.5；antex 编译于 ante-sdk 0.3.5，同一版本系列`。运行期的「未连接 / 事件流结束 / 消息被丢弃」也写同一处，不会静默。
 
 **启动后模型列表要等几秒？**
-垫片每个请求都 spawn 一个 `ante catalog`（不缓存），TUI 起来时会并发拉三个。而 `ante catalog` 进程退出前要刷
-OpenTelemetry 指标，网络一慢就是那几秒（同一二进制的 `ante --version` 只要几毫秒，可作对照）。关掉遥测即可：
+垫片每个请求都 spawn 一个 `ante catalog`（不缓存），TUI 起来时会并发拉三个。`antex` 会给所有 Ante 子进程
+强制加 `ANTE_TELEMETRY=off`，所以没有 OTLP 导出在等网络；Ante 0.3.9 的 `ante catalog` 本身也跳过遥测导出。
+如果仍然慢，看 `/tmp/antex.log` 和启动自检那行。
+
+直接跑 Ante 时，遥测要自己关：
 
 ```sh
 export ANTE_TELEMETRY=off      # 取值 off / false / 0 / disable / disabled，大小写不敏感

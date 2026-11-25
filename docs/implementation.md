@@ -143,6 +143,23 @@ Ante 暂停时（`TurnPause{Approval}`）垫片发 `permission.asked`，TUI 弹�
 Ante 的权限模式由环境变量决定：`SHIM_PERMISSION_MODE=strict|auto|yolo`（默认 `auto`）。
 要测审批弹窗用 `strict`——`auto` 下多数命令被判定为「可证明安全」直接放行。
 
+## 遥测
+
+**antex 已禁止遥测：自身没有埋点，且强制关闭所有 Ante 子进程的 OTLP 导出。**
+
+所有 `ante` 子进程都显式带 `ANTE_TELEMETRY=off`，不依赖调用环境：
+
+- `ante serve --stdio`：`connect_ante()` 的 `ConnectOptions.env`（`src/main.rs`）。
+- `ante catalog`、`ante auth list|add|rm|login`：`src/integrations.rs`。
+- `ante usage`：`src/quota.rs`。
+- `ante --version` 与版本探测：`src/main.rs`。
+
+自编 opencode TUI 的 OTLP 只在 `OTEL_EXPORTER_OTLP_ENDPOINT` 存在时启用；antex 不设该变量。
+
+**验法**：`ANTE_BIN` 指向一个把 `$ANTE_TELEMETRY` 记进文件的假 `ante`，父进程故意设
+`ANTE_TELEMETRY=on`，启动 `antex serve PORT` 后请求 `/api/model` 与 `/api/integration`；假 `ante`
+每次调用都必须是 `off`。`cargo test` 不覆盖子进程环境，必须用这条假二进制验。
+
 ## 验收与排错开关
 
 - **改完垫片必须重启进程**：`target/release/antex` 是产物，旧进程不会自更新——改动不上线，看着像「没修好」。

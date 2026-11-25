@@ -81,7 +81,12 @@ struct Provider {
 /// binary is the only thing that prints the merge.
 pub async fn merged_catalog() -> Vec<Value> {
     let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
-    let Ok(out) = tokio::process::Command::new(bin).arg("catalog").output().await else {
+    let Ok(out) = tokio::process::Command::new(bin)
+        .env("ANTE_TELEMETRY", "off")
+        .arg("catalog")
+        .output()
+        .await
+    else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -257,7 +262,11 @@ fn stored_credentials() -> (Map<String, Value>, Vec<String>) {
     let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
     let mut keys = Map::new();
     let mut presets = Vec::new();
-    if let Ok(out) = std::process::Command::new(bin).args(["auth", "list"]).output() {
+    if let Ok(out) = std::process::Command::new(bin)
+        .env("ANTE_TELEMETRY", "off")
+        .args(["auth", "list"])
+        .output()
+    {
         if out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
                 let mut fields = line.split_whitespace();
@@ -384,7 +393,9 @@ pub async fn connect_key(Path(id): Path<String>, Json(body): Json<Value>) -> Res
         return error(StatusCode::BAD_REQUEST, "the key is empty");
     }
     let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
-    let mut child = match tokio::process::Command::new(bin).args(["auth", "add", &secret])
+    let mut child = match tokio::process::Command::new(bin)
+        .env("ANTE_TELEMETRY", "off")
+        .args(["auth", "add", &secret])
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
         Ok(child) => child,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot start ante auth add: {e}")),
@@ -462,7 +473,12 @@ pub async fn credential_delete(Path(id): Path<String>) -> Response {
     });
     if shared { return error(StatusCode::BAD_REQUEST, "credential is shared by other providers; manage it with ante auth rm"); }
     let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
-    match tokio::process::Command::new(bin).args(["auth", "rm", target]).output().await {
+    match tokio::process::Command::new(bin)
+        .env("ANTE_TELEMETRY", "off")
+        .args(["auth", "rm", target])
+        .output()
+        .await
+    {
         Ok(out) if out.status.success() => StatusCode::NO_CONTENT.into_response(),
         _ => error(StatusCode::INTERNAL_SERVER_ERROR, "ante auth rm failed"),
     }
@@ -856,6 +872,7 @@ fn write_openai_credential(tokens: &Value) -> Result<(), String> {
 async fn start_antix(attempt_id: &str, preset: &str) -> Result<(String, String, CancelFn), String> {
     let bin = crate::ante_executable().unwrap_or_else(|| PathBuf::from("ante"));
     let mut child = tokio::process::Command::new(bin)
+        .env("ANTE_TELEMETRY", "off")
         .args(["auth", "login", preset])
         .kill_on_drop(true)
         .stdin(Stdio::null())

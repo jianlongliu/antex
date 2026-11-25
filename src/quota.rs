@@ -444,6 +444,7 @@ fn subscription_state(body: &Value) -> Subscription {
 async fn chatgpt() -> Result<Quota, String> {
     let bin = crate::ante_executable().ok_or_else(|| "ante not found".to_string())?;
     let out = tokio::process::Command::new(bin)
+        .env("ANTE_TELEMETRY", "off")
         .arg("usage")
         .arg("--json")
         .output()

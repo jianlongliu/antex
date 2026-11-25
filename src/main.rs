@@ -1970,7 +1970,12 @@ fn same_series(left: &str, right: &str) -> bool {
 
 /// `ante --version` → `ante 0.2.5` → `0.2.5`.
 async fn ante_version(bin: &std::path::Path) -> Option<String> {
-    let out = tokio::process::Command::new(bin).arg("--version").output().await.ok()?;
+    let out = tokio::process::Command::new(bin)
+        .env("ANTE_TELEMETRY", "off")
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().last().map(str::to_string)
 }
@@ -2263,6 +2268,11 @@ async fn connect_ante() -> Result<ante_sdk::Client, String> {
     let bin = ante_executable();
     let mut options = ConnectOptions::default();
     options.executable = bin.clone();
+    // Ante's telemetry is opt-out and on by default. antex is local plumbing,
+    // not a telemetry client: force the switch on the host we spawn so neither
+    // an inherited ANTE_TELEMETRY=on nor a launcher without the variable can
+    // turn it back on. This is the process that would actually export.
+    options.env.insert("ANTE_TELEMETRY".to_string(), "off".to_string());
     connect(endpoint, options).await.map_err(|err| {
         format!(
             "could not connect: {err}\n  ante = {}; antex built against ante-sdk {}",
@@ -6149,7 +6159,11 @@ fn print_version() {
 /// The first line of `<exe> --version`, or `None` when it cannot run or only
 /// prints a placeholder that names no release.
 fn probe_version(exe: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(exe).arg("--version").output().ok()?;
+    let out = std::process::Command::new(exe)
+        .env("ANTE_TELEMETRY", "off")
+        .arg("--version")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
