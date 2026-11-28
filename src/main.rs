@@ -4518,13 +4518,31 @@ fn safe_id(id: &str) -> bool {
 
 /// Ante keeps its sessions on disk; opencode wants a session list, so this reads
 /// that directory and maps it into `Session.Info`.
+///
+/// The expensive part is the effort lookup: every session's answer lives in its
+/// `events.jsonl`, and those logs total hundreds of megabytes. Do that pass in
+/// parallel before the mapping loop; the loop then reads every answer from
+/// [`EFFORT_CACHE`]. The order of the finished list is still fixed by the sort
+/// below, so the worker count cannot change the response.
 fn ante_sessions() -> Vec<Value> {
     let Ok(entries) = std::fs::read_dir(ante_home().join("sessions")) else {
         return Vec::new();
     };
+    let entries: Vec<_> = entries.flatten().collect();
+    let dirs: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    warm_efforts(&dirs);
+    // One snapshot for the whole list: `settings()` parses the file every time it
+    // is called, and the old loop asked for it once per session (agent and saved
+    // level each).
+    let settings = settings();
+    let agent = reported_agent();
+    let location = loc_plain();
 
     let mut sessions: Vec<(i64, Value)> = entries
-        .flatten()
+        .into_iter()
         .filter_map(|entry| {
             let dir = entry.file_name().to_string_lossy().into_owned();
             let meta = session_meta(&dir);
@@ -4572,14 +4590,14 @@ fn ante_sessions() -> Vec<Value> {
             let info = json!({
                 "id": id,
                 "projectID": "prj_shim",
-                "agent": reported_agent(),
+                "agent": agent,
                 "model": {
                     "id": model,
                     "providerID": provider,
                     // The picker draws its `/variants` selection from this, so it
                     // has to answer with the level that will run even before the
                     // session has a log of its own.
-                    "variant": session_variant(&dir, &model),
+                    "variant": session_variant_in(&dir, &model, &settings),
                 },
                 "cost": 0,
                 "tokens": tokens,
@@ -4588,7 +4606,7 @@ fn ante_sessions() -> Vec<Value> {
                 // Same rule as `ante_session_info`: only the shim's own location,
                 // or the client ends up asking about a directory `/api/location`
                 // will never confirm (that is what broke the session picker).
-                "location": loc_plain(),
+                "location": location.clone(),
             });
             Some((created, info))
         })
@@ -4596,7 +4614,41 @@ fn ante_sessions() -> Vec<Value> {
 
     // Newest first, which is the order the picker shows.
     sessions.sort_by(|a, b| b.0.cmp(&a.0));
-    sessions.into_iter().map(|(_, info)| info).collect()
+    let sessions = sessions.into_iter().map(|(_, info)| info).collect();
+    // The first list after a restart may have had to read logs that were not in
+    // the on-disk cache yet; persist those answers so the next start does not
+    // repeat the walk.
+    save_effort_cache();
+    sessions
+}
+
+/// Fill [`EFFORT_CACHE`] for every session before the list is built. On a warm
+/// cache this is just one `stat` per log; on a cold one it spreads the reads over
+/// the available cores instead of walking half a gigabyte on one thread.
+fn warm_efforts(dirs: &[String]) {
+    if dirs.is_empty() {
+        return;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    if workers == 1 || dirs.len() < 2 {
+        for dir in dirs {
+            let _ = recorded_effort(dir);
+        }
+        return;
+    }
+    let chunk = dirs.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        for part in dirs.chunks(chunk) {
+            scope.spawn(move || {
+                for dir in part {
+                    let _ = recorded_effort(dir);
+                }
+            });
+        }
+    });
 }
 
 /// `DELETE /api/session/{id}` — what `ctrl+d` (pressed twice) in the sessions
@@ -4770,13 +4822,23 @@ fn meta_model(meta: &Value) -> (String, String) {
 /// the saved level: the picker drew an unset override and the client, seeing
 /// nothing, re-committed "no level" and wiped it for real.
 fn session_variant(id: &str, model: &str) -> String {
-    pick_variant(recorded_effort(id), saved_effort(model))
+    session_variant_in(id, model, &settings())
+}
+
+/// [`session_variant`] against a settings snapshot, for a caller building many
+/// rows: parsing `settings.json` once beats parsing it once per session.
+fn session_variant_in(id: &str, model: &str, settings: &Value) -> String {
+    pick_variant(recorded_effort(id), saved_effort_in(settings, model))
 }
 
 /// The level saved for one model in `settings.json`, as a JSON value so
 /// [`pick_variant`] can reject a non-string.
 fn saved_effort(model: &str) -> Option<Value> {
-    settings().get("model_effort").and_then(|per_model| per_model.get(model)).cloned()
+    saved_effort_in(&settings(), model)
+}
+
+fn saved_effort_in(settings: &Value, model: &str) -> Option<Value> {
+    settings.get("model_effort").and_then(|per_model| per_model.get(model)).cloned()
 }
 
 /// [`session_variant`] with both sources passed in, so the precedence can be
@@ -4792,30 +4854,130 @@ fn pick_variant(recorded: Option<String>, saved: Option<Value>) -> String {
 /// `meta.json` records the provider and model but never the effort — an
 /// `UpdateSession` stays in memory — so the only durable answer is the last
 /// `SessionUpdated` in the session's own log. It reports what Ante *resolved* to,
-/// which is what the client should draw. The walk is backwards from the end so a
-/// multi-megabyte log costs one parse, not thousands.
+/// which is what the client should draw.
+///
+/// The answer depends only on the log file, so it is cached against its length
+/// and mtime. `ante_sessions` asks for every session, and the logs here total
+/// hundreds of megabytes; re-reading them for each list request is what made the
+/// picker take half a second.
 fn recorded_effort(id: &str) -> Option<String> {
     let path = ante_home().join("sessions").join(id).join("events.jsonl");
-    recorded_effort_at(&path)
+    let (len, modified_ms) = effort_stamp(&path)?;
+    let key = path.to_string_lossy().into_owned();
+    {
+        let cache = EFFORT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(stamp) = cache.entries.get(&key)
+            && stamp.len == len
+            && stamp.modified_ms == modified_ms
+        {
+            return stamp.effort.clone();
+        }
+    }
+    let effort = recorded_effort_at(&path);
+    let mut cache = EFFORT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.entries.insert(key, EffortStamp { len, modified_ms, effort: effort.clone() });
+    cache.dirty = true;
+    effort
+}
+
+/// One cached `recorded_effort` answer, tied to the file version it came from.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct EffortStamp {
+    len: u64,
+    modified_ms: u64,
+    effort: Option<String>,
+}
+
+#[derive(Default)]
+struct EffortCache {
+    entries: HashMap<String, EffortStamp>,
+    dirty: bool,
+}
+
+/// The shim's own state, not Ante's: Ante owns `sessions/`, `settings.json` and
+/// the snapshot, and never reads this file.
+fn effort_cache_path() -> std::path::PathBuf {
+    ante_home().join(".antex-cache").join("effort.json")
+}
+
+static EFFORT_CACHE: std::sync::LazyLock<Mutex<EffortCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(load_effort_cache()));
+
+fn load_effort_cache() -> EffortCache {
+    let entries = std::fs::read_to_string(effort_cache_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HashMap<String, EffortStamp>>(&raw).ok())
+        .unwrap_or_default();
+    EffortCache { entries, dirty: false }
+}
+
+/// Persist the cache after a list build. Failure is not fatal: the in-memory
+/// answers remain valid for this process, and the next start simply rebuilds.
+fn save_effort_cache() {
+    let body = {
+        let mut cache = EFFORT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !cache.dirty {
+            return;
+        }
+        cache.dirty = false;
+        match serde_json::to_vec(&cache.entries) {
+            Ok(body) => body,
+            Err(_) => return,
+        }
+    };
+    let path = effort_cache_path();
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let temp = path.with_extension("json.tmp");
+    if std::fs::write(&temp, body).is_ok() && std::fs::rename(&temp, &path).is_ok() {
+        return;
+    }
+    // Let a later list retry the write instead of leaving the cache permanently
+    // marked clean after a transient permission or disk error.
+    if let Ok(mut cache) = EFFORT_CACHE.lock() {
+        cache.dirty = true;
+    }
+}
+
+fn effort_stamp(path: &std::path::Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    Some((metadata.len(), modified_ms))
 }
 
 /// [`recorded_effort`] on an explicit log path, so it can be tested without
 /// pointing the whole process at a temporary home.
+///
+/// Every line is a JSON object, and a log can be tens of megabytes. Parsing each
+/// line from the end just to throw most of them away is the slow part, so this
+/// finds the last `"SessionUpdated"` occurrence first and parses only the line it
+/// lands on. A user message that happens to contain that text parses as a
+/// non-event and the search moves on.
 fn recorded_effort_at(path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
-    for line in raw.lines().rev() {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(updated) = entry.get("event").and_then(|event| event.get("SessionUpdated"))
-        else {
-            continue;
-        };
-        if let Some(effort) =
-            updated.get("model").and_then(|model| model.get("effort")).and_then(Value::as_str)
+    let mut end = raw.len();
+    while let Some(pos) = raw[..end].rfind("\"SessionUpdated\"") {
+        let start = raw[..pos].rfind('\n').map_or(0, |index| index + 1);
+        let stop = raw[pos..].find('\n').map_or(raw.len(), |index| pos + index);
+        if let Ok(entry) = serde_json::from_str::<Value>(&raw[start..stop])
+            && let Some(effort) = entry
+                .get("event")
+                .and_then(|event| event.get("SessionUpdated"))
+                .and_then(|updated| updated.get("model"))
+                .and_then(|model| model.get("effort"))
+                .and_then(Value::as_str)
         {
             return Some(effort.to_string());
         }
+        end = start;
     }
     None
 }
@@ -7431,6 +7593,30 @@ mod tests {
         let log = dir.join("events.jsonl");
         std::fs::write(&log, format!("{}\n{}\n", line("high"), line("max"))).unwrap();
         assert_eq!(recorded_effort_at(&log), Some("max".to_string()));
+        // A long line before the last report must not force a parse of every
+        // line in the file; the byte search goes straight to the event name.
+        let filler = "x".repeat(200_000);
+        std::fs::write(
+            &log,
+            format!(
+                "{{\"event\":{{\"UserInput\":\"{filler}\"}}}}\n{}\n{}\n",
+                line("high"),
+                line("max")
+            ),
+        )
+        .unwrap();
+        assert_eq!(recorded_effort_at(&log), Some("max".to_string()));
+        // A later line that only mentions the event name must not hide the real
+        // report before it.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n{{\"event\":{{\"UserInput\":\"mentions SessionUpdated\"}}}}\n",
+                line("high")
+            ),
+        )
+        .unwrap();
+        assert_eq!(recorded_effort_at(&log), Some("high".to_string()));
         // A log with no `SessionUpdated` at all, and one that does not exist,
         // both answer "unknown" rather than inventing a level.
         std::fs::write(&log, "{\"event\":{\"TurnStart\":{}}}\n").unwrap();
